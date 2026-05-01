@@ -80,6 +80,13 @@ enum AppStatus {
     AdapterRefreshFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionMonitorFilter {
+    Active,
+    Recent,
+    All,
+}
+
 enum UpdateMessage {
     Check(Result<crate::update::UpdateInfo, String>),
     Install(Result<String, String>),
@@ -112,6 +119,7 @@ struct NetCombinerApp {
     log_file: Option<fs::File>,
     show_logs: bool,
     show_connection_window: bool,
+    connection_monitor_filter: ConnectionMonitorFilter,
     show_tray_options: bool,
     close_to_tray: bool,
     tray_available: bool,
@@ -185,6 +193,7 @@ impl NetCombinerApp {
             log_file,
             show_logs: false,
             show_connection_window: false,
+            connection_monitor_filter: ConnectionMonitorFilter::Active,
             show_tray_options: false,
             close_to_tray: true,
             tray_available,
@@ -544,6 +553,13 @@ impl NetCombinerApp {
         self.connections
             .iter()
             .filter(|row| row.closed_at.is_some())
+            .count()
+    }
+
+    fn connection_count_for(&self, filter: ConnectionMonitorFilter) -> usize {
+        self.connections
+            .iter()
+            .filter(|row| connection_matches_filter(row, filter))
             .count()
     }
 
@@ -1460,7 +1476,7 @@ impl NetCombinerApp {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        tinted_pill(
+                        if pill_button(
                             ui,
                             theme,
                             &format!(
@@ -1468,10 +1484,13 @@ impl NetCombinerApp {
                                 self.active_connection_count(),
                                 t.connections_active
                             ),
-                            theme.success_soft,
-                            theme.success,
-                        );
-                        tinted_pill(
+                            self.connection_monitor_filter == ConnectionMonitorFilter::Active,
+                        )
+                        .clicked()
+                        {
+                            self.connection_monitor_filter = ConnectionMonitorFilter::Active;
+                        }
+                        if pill_button(
                             ui,
                             theme,
                             &format!(
@@ -1479,9 +1498,22 @@ impl NetCombinerApp {
                                 self.recent_connection_count(),
                                 t.connections_recent
                             ),
-                            theme.surface_alt,
-                            theme.text_muted,
-                        );
+                            self.connection_monitor_filter == ConnectionMonitorFilter::Recent,
+                        )
+                        .clicked()
+                        {
+                            self.connection_monitor_filter = ConnectionMonitorFilter::Recent;
+                        }
+                        if pill_button(
+                            ui,
+                            theme,
+                            &format!("{} {}", self.connections.len(), t.connections_all),
+                            self.connection_monitor_filter == ConnectionMonitorFilter::All,
+                        )
+                        .clicked()
+                        {
+                            self.connection_monitor_filter = ConnectionMonitorFilter::All;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if pill_button(ui, theme, t.clear_all_connections, false).clicked() {
                                 self.connections.clear();
@@ -1504,11 +1536,24 @@ impl NetCombinerApp {
     }
 
     fn draw_connection_table(&self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+        let visible_count = self.connection_count_for(self.connection_monitor_filter);
         egui::Frame::new()
             .fill(theme.log_bg)
             .stroke(egui::Stroke::new(1.0, theme.border))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
+                if visible_count == 0 {
+                    ui.add_space(18.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(t.connections_empty)
+                                .size(13.0)
+                                .color(theme.text_muted),
+                        );
+                    });
+                    return;
+                }
+
                 egui::ScrollArea::both()
                     .id_salt("connection_monitor_table_scroll")
                     .auto_shrink([false, false])
@@ -1536,7 +1581,9 @@ impl NetCombinerApp {
                                 table_header(ui, theme, t.column_reason);
                                 ui.end_row();
 
-                                for row in &self.connections {
+                                for row in self.connections.iter().filter(|row| {
+                                    connection_matches_filter(row, self.connection_monitor_filter)
+                                }) {
                                     draw_connection_table_row(ui, theme, t, row);
                                 }
                             });
@@ -2320,6 +2367,14 @@ fn table_cell(ui: &mut egui::Ui, _theme: &Theme, text: &str, color: egui::Color3
     );
 }
 
+fn connection_matches_filter(row: &ConnectionRow, filter: ConnectionMonitorFilter) -> bool {
+    match filter {
+        ConnectionMonitorFilter::Active => row.closed_at.is_none(),
+        ConnectionMonitorFilter::Recent => row.closed_at.is_some(),
+        ConnectionMonitorFilter::All => true,
+    }
+}
+
 fn draw_status_pill(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -2658,6 +2713,7 @@ struct Texts<'a> {
     connections_empty: &'a str,
     connections_active: &'a str,
     connections_recent: &'a str,
+    connections_all: &'a str,
     connection_target: &'a str,
     connection_adapter: &'a str,
     connection_client: &'a str,
@@ -2779,6 +2835,7 @@ impl<'a> Texts<'a> {
                 connections_empty: "아직 연결된 대상이 없습니다.",
                 connections_active: "활성",
                 connections_recent: "최근",
+                connections_all: "전체",
                 connection_target: "대상",
                 connection_adapter: "어댑터",
                 connection_client: "클라이언트",
@@ -2896,6 +2953,7 @@ impl<'a> Texts<'a> {
                 connections_empty: "No active or recent connections yet.",
                 connections_active: "active",
                 connections_recent: "recent",
+                connections_all: "all",
                 connection_target: "Target",
                 connection_adapter: "Adapter",
                 connection_client: "Client",

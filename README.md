@@ -28,10 +28,6 @@ configuring every application by hand.
 - System tray on Windows and macOS.
 - GitHub Releases based self-update for portable builds.
 
-`net-combiner` is not a fork of `dispatch`; it reimplements the adapter-binding
-idea in a new Rust application with a GUI, tray behavior, packaging, and a VPN
-workflow.
-
 ## How It Works
 
 ```mermaid
@@ -156,7 +152,7 @@ a `bin` directory, then on `PATH`.
 Tag a version and push it:
 
 ```powershell
-git tag v0.1.0
+git tag v0.1.1
 git push origin main --tags
 ```
 

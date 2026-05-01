@@ -1,6 +1,6 @@
 #define MyAppVersion GetEnv("NET_COMBINER_VERSION")
 #if MyAppVersion == ""
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #endif
 
 [Setup]
@@ -35,8 +35,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\..\dist\net-combiner\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\net-combiner"; Filename: "{app}\net-combiner.exe"
-Name: "{commondesktop}\net-combiner"; Filename: "{app}\net-combiner.exe"; Tasks: desktopicon
+Name: "{group}\net-combiner"; Filename: "{app}\net-combiner.exe"; IconFilename: "{app}\net-combiner.exe"
+Name: "{commondesktop}\net-combiner"; Filename: "{app}\net-combiner.exe"; IconFilename: "{app}\net-combiner.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\net-combiner.exe"; Description: "{cm:LaunchProgram,net-combiner}"; Flags: nowait postinstall skipifsilent

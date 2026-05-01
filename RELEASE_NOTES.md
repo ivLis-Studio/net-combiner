@@ -1,8 +1,13 @@
-# net-combiner v0.1.0
+# net-combiner v0.1.1
 
-Initial public release.
+This release is a polish update for the first public build.
 
-This release includes the desktop GUI, weighted SOCKS5 proxy, local VPN mode through `tun2proxy`, live connection monitoring, log files, Windows and macOS tray integration, Korean UI text, and GitHub Releases based updates for portable builds.
+## Changes
+
+- Windows builds now use the GUI subsystem, so launching the desktop app no longer opens a console window.
+- The Windows executable now embeds the net-combiner icon resource. Installer-created Start Menu and Desktop shortcuts use that icon explicitly.
+- The connection monitor now opens on active connections by default and includes filters for active, recent, and all rows.
+- README files no longer mention earlier implementation references.
 
 ## Packages
 

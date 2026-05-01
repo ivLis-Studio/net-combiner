@@ -21,8 +21,6 @@
 - Windows 및 macOS 시스템 트레이.
 - GitHub Releases 기반 portable 빌드 자동 업데이트.
 
-`net-combiner`는 `dispatch`의 fork가 아닙니다. 어댑터 주소에 outbound socket을 bind한다는 핵심 아이디어를 Rust 데스크톱 앱으로 새로 구현했고, GUI, 트레이, 패키징, VPN 흐름을 별도로 설계했습니다.
-
 ## 동작 구조
 
 ```mermaid
@@ -133,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-local.ps1
 버전 태그를 만들고 push합니다.
 
 ```powershell
-git tag v0.1.0
+git tag v0.1.1
 git push origin main --tags
 ```
 
