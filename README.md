@@ -152,7 +152,7 @@ a `bin` directory, then on `PATH`.
 Tag a version and push it:
 
 ```powershell
-git tag v0.1.5
+git tag v0.1.6
 git push origin main --tags
 ```
 

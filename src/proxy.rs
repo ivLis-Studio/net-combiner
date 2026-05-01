@@ -88,6 +88,7 @@ pub async fn run_proxy(
         &log,
         format!("selected egress adapters: {}", pool.describe()),
     );
+    log_line(&log, "egress policy: sticky per destination IP");
 
     let connection_id = Arc::new(AtomicU64::new(1));
     loop {
@@ -338,14 +339,15 @@ async fn connect_via_pool(
     let mut last_error: Option<anyhow::Error> = None;
 
     for remote in candidates {
-        let attempts = pool.family_count(remote.ip()).max(1);
-        for _ in 0..attempts {
-            let selected = pool.next(remote.ip()).with_context(|| {
-                format!(
-                    "no selected egress adapter can reach {}",
-                    family_name(remote.ip())
-                )
-            })?;
+        let selections = pool.ordered_for(remote.ip());
+        if selections.is_empty() {
+            last_error = Some(anyhow!(
+                "no selected egress adapter can reach {}",
+                family_name(remote.ip())
+            ));
+            continue;
+        }
+        for selected in selections {
             match connect_bound(selected.ip, remote).await {
                 Ok(stream) => return Ok((stream, selected)),
                 Err(error) => {
@@ -534,22 +536,26 @@ async fn run_udp_relay(context: UdpRelayContext) -> Result<()> {
                     if let Some(socket) = guard.get(&remote) {
                         socket.clone()
                     } else {
-                        let selected = match pool.next(remote.ip()) {
-                            Some(value) => value,
-                            None => {
-                                log_line(&log, format!("#{id} no UDP egress for {}", family_name(remote.ip())));
-                                continue;
+                        let mut bound = None;
+                        for candidate in pool.ordered_for(remote.ip()) {
+                            match bind_udp_socket(candidate.ip, remote).await {
+                                Ok(socket) => {
+                                    bound = Some((candidate, Arc::new(socket)));
+                                    break;
+                                }
+                                Err(error) => {
+                                    log_line(
+                                        &log,
+                                        format!(
+                                            "#{id} failed to bind UDP via {} ({}): {error}",
+                                            candidate.name, candidate.ip
+                                        ),
+                                    );
+                                }
                             }
-                        };
-                        let socket = match bind_udp_socket(selected.ip, remote).await {
-                            Ok(socket) => Arc::new(socket),
-                            Err(error) => {
-                                log_line(
-                                    &log,
-                                    format!("#{id} failed to bind UDP via {} ({}): {error}", selected.name, selected.ip),
-                                );
-                                continue;
-                            }
+                        }
+                        let Some((selected, socket)) = bound else {
+                            continue;
                         };
                         log_line(&log, format!("#{id} UDP {remote} via {} ({})", selected.name, selected.ip));
                         emit_connection(
@@ -792,12 +798,15 @@ impl WeightedPool {
         }
     }
 
-    fn next(&self, remote_ip: IpAddr) -> Option<EgressTarget> {
+    fn ordered_for(&self, remote_ip: IpAddr) -> Vec<EgressTarget> {
         let state = match remote_ip {
             IpAddr::V4(_) => &self.v4,
             IpAddr::V6(_) => &self.v6,
         };
-        state.lock().expect("weighted pool mutex poisoned").next()
+        state
+            .lock()
+            .expect("weighted pool mutex poisoned")
+            .ordered_for(remote_ip)
     }
 
     fn has_family(&self, remote_ip: IpAddr) -> bool {
@@ -846,7 +855,6 @@ impl WeightedState {
                 .into_iter()
                 .map(|target| WeightedEntry {
                     weight: i64::from(target.weight.max(1)),
-                    current: 0,
                     target,
                 })
                 .collect(),
@@ -857,26 +865,29 @@ impl WeightedState {
         self.entries.len()
     }
 
-    fn next(&mut self) -> Option<EgressTarget> {
+    fn ordered_for(&self, remote_ip: IpAddr) -> Vec<EgressTarget> {
         if self.entries.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        let mut total = 0_i64;
-        let mut best_index = 0_usize;
-        let mut best_score = i64::MIN;
-
-        for (index, entry) in self.entries.iter_mut().enumerate() {
-            total += entry.weight;
-            entry.current += entry.weight;
-            if entry.current > best_score {
-                best_score = entry.current;
-                best_index = index;
+        let total = self.entries.iter().map(|entry| entry.weight).sum::<i64>();
+        let mut slot = (stable_ip_hash(remote_ip) % total as u64) as i64;
+        let mut first_index = 0_usize;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if slot < entry.weight {
+                first_index = index;
+                break;
             }
+            slot -= entry.weight;
         }
 
-        self.entries[best_index].current -= total;
-        Some(self.entries[best_index].target.clone())
+        (0..self.entries.len())
+            .map(|offset| {
+                self.entries[(first_index + offset) % self.entries.len()]
+                    .target
+                    .clone()
+            })
+            .collect()
     }
 
     fn describe(&self) -> Vec<String> {
@@ -896,7 +907,20 @@ impl WeightedState {
 struct WeightedEntry {
     target: EgressTarget,
     weight: i64,
-    current: i64,
+}
+
+fn stable_ip_hash(ip: IpAddr) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let bytes: Vec<u8> = match ip {
+        IpAddr::V4(addr) => addr.octets().to_vec(),
+        IpAddr::V6(addr) => addr.octets().to_vec(),
+    };
+
+    bytes.into_iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 fn family_name(ip: IpAddr) -> &'static str {

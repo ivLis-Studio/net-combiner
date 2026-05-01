@@ -1,15 +1,14 @@
-# net-combiner v0.1.5
+# net-combiner v0.1.6
 
-This release tightens the default VPN workflow and adds runtime safeguards for long-running desktop use.
+This release fixes unstable large transfers when multiple selected adapters are active.
 
 ## Changes
 
-- Changed the default mode selection to VPN mode.
-- Replaced the theme text toggle with a compact vector icon toggle.
-- Reworked the run-page route graphic so it reflects the actual selected adapter count and selected source names.
-- Added rotating log files capped at 2 MiB, keeping the last three rotated logs beside the active log.
-- Added a Windows single-instance guard. Starting a second GUI instance now shows an alert and exits the new instance.
-- Added a runtime adapter watchdog. If a selected adapter disappears or changes while proxy/VPN is running, net-combiner stops the route and shows an alert.
+- Changed egress selection from per-connection round-robin to sticky routing per destination IP.
+- Kept parallel range/download connections to the same server on the same source adapter, which avoids server-side and local TCP resets caused by changing source IPs mid-download.
+- Preserved adapter failover: if the sticky adapter cannot connect, net-combiner tries the remaining selected adapters.
+- Applied the same sticky destination policy to UDP relay socket selection.
+- Added a startup log line showing the active egress policy.
 
 ## Packages
 
