@@ -206,7 +206,7 @@ impl NetCombinerApp {
             tray_rx: if tray_available { Some(tray_rx) } else { None },
             tray_language,
             update_rx: None,
-            update_status: "Update check will run automatically.".to_owned(),
+            update_status: update_idle_status(language).to_owned(),
             update_busy: false,
             update_auto_checked: false,
             last_refresh: None,
@@ -653,23 +653,16 @@ impl NetCombinerApp {
             self.update_busy = false;
             match message {
                 UpdateMessage::Check(Ok(info)) => {
-                    if info.available {
-                        self.update_status = format!(
-                            "Update available: {} -> {}",
-                            info.current_version, info.latest_version
-                        );
-                    } else {
-                        self.update_status = format!("Up to date: {}", info.current_version);
-                    }
+                    self.update_status = update_check_status(self.language, &info);
                 }
                 UpdateMessage::Check(Err(error)) => {
-                    self.update_status = format!("Update check failed: {error}");
+                    self.update_status = update_error_status(self.language, "check", &error);
                 }
                 UpdateMessage::Install(Ok(status)) => {
-                    self.update_status = format!("Update finished: {status}. Restart the app.");
+                    self.update_status = update_install_status(self.language, &status);
                 }
                 UpdateMessage::Install(Err(error)) => {
-                    self.update_status = format!("Update failed: {error}");
+                    self.update_status = update_error_status(self.language, "install", &error);
                 }
             }
         }
@@ -680,7 +673,7 @@ impl NetCombinerApp {
             return;
         }
         self.update_busy = true;
-        self.update_status = "Checking for updates...".to_owned();
+        self.update_status = update_checking_status(self.language).to_owned();
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
         thread::spawn(move || {
@@ -694,7 +687,7 @@ impl NetCombinerApp {
             return;
         }
         self.update_busy = true;
-        self.update_status = "Installing update...".to_owned();
+        self.update_status = update_installing_status(self.language).to_owned();
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
         thread::spawn(move || {
@@ -731,6 +724,22 @@ impl eframe::App for NetCombinerApp {
             )
             .show(ctx, |ui| {
                 self.draw_top_bar(ui, &theme, &t);
+            });
+
+        egui::TopBottomPanel::bottom("app_footer")
+            .exact_height(94.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.bg)
+                    .inner_margin(egui::Margin {
+                        left: 28,
+                        right: 28,
+                        top: 8,
+                        bottom: 8,
+                    }),
+            )
+            .show(ctx, |ui| {
+                self.draw_app_footer(ui, &theme, &t);
             });
 
         egui::CentralPanel::default()
@@ -831,6 +840,55 @@ impl NetCombinerApp {
             if pill_button(ui, theme, "EN", active_en).clicked() {
                 self.language = Language::English;
             }
+        });
+    }
+
+    fn draw_app_footer(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+        divider(ui, theme);
+        ui.add_space(8.0);
+        ui.columns(3, |columns| {
+            columns[0].vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("ivLis-Studio")
+                        .size(13.0)
+                        .strong()
+                        .color(theme.text),
+                );
+                ui.add_space(2.0);
+                ui.hyperlink_to(
+                    egui::RichText::new("github.com/ivLis-Studio/net-combiner")
+                        .size(11.0)
+                        .color(theme.primary),
+                    "https://github.com/ivLis-Studio/net-combiner",
+                );
+            });
+
+            columns[1].vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(t.update_title)
+                        .size(12.0)
+                        .strong()
+                        .color(theme.text),
+                );
+                ui.add_space(2.0);
+                wrapped_label(ui, &self.update_status, 11.0, theme.text_muted);
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .monospace()
+                        .color(theme.text_muted),
+                );
+            });
+
+            columns[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if primary_button(ui, theme, t.update_install, !self.update_busy).clicked() {
+                    self.start_update_install();
+                }
+                if pill_button(ui, theme, t.update_check, self.update_busy).clicked() {
+                    self.start_update_check();
+                }
+            });
         });
     }
 }
@@ -3410,6 +3468,63 @@ fn tray_language_for(language: Language) -> TrayLanguage {
     match language {
         Language::English => TrayLanguage::English,
         Language::Korean => TrayLanguage::Korean,
+    }
+}
+
+fn update_idle_status(language: Language) -> &'static str {
+    match language {
+        Language::English => "Automatic update check is enabled.",
+        Language::Korean => "자동 업데이트 확인이 켜져 있습니다.",
+    }
+}
+
+fn update_checking_status(language: Language) -> &'static str {
+    match language {
+        Language::English => "Checking GitHub Releases...",
+        Language::Korean => "GitHub Releases에서 업데이트를 확인하는 중...",
+    }
+}
+
+fn update_installing_status(language: Language) -> &'static str {
+    match language {
+        Language::English => "Downloading and installing the latest release...",
+        Language::Korean => "최신 릴리즈를 다운로드하고 설치하는 중...",
+    }
+}
+
+fn update_check_status(language: Language, info: &crate::update::UpdateInfo) -> String {
+    if info.available {
+        match language {
+            Language::English => format!(
+                "Update available: {} -> {}",
+                info.current_version, info.latest_version
+            ),
+            Language::Korean => format!(
+                "업데이트 가능: {} -> {}",
+                info.current_version, info.latest_version
+            ),
+        }
+    } else {
+        match language {
+            Language::English => format!("Up to date: {}", info.current_version),
+            Language::Korean => format!("최신 상태입니다: {}", info.current_version),
+        }
+    }
+}
+
+fn update_install_status(language: Language, status: &str) -> String {
+    match language {
+        Language::English => format!("Update finished: {status}. Restart the app."),
+        Language::Korean => format!("업데이트 완료: {status}. 앱을 다시 시작하세요."),
+    }
+}
+
+fn update_error_status(language: Language, phase: &str, error: &str) -> String {
+    match (language, phase) {
+        (Language::English, "check") => format!("Update check failed: {error}"),
+        (Language::Korean, "check") => format!("업데이트 확인 실패: {error}"),
+        (Language::English, _) => format!("Update failed: {error}"),
+        (Language::Korean, _) => format!("업데이트 실패: {error}"),
     }
 }
 
