@@ -131,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-local.ps1
 버전 태그를 만들고 push합니다.
 
 ```powershell
-git tag v0.1.4
+git tag v0.1.5
 git push origin main --tags
 ```
 

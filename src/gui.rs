@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
@@ -17,9 +17,12 @@ use crate::tray::{self, TrayEvent, TrayHandle, TrayLanguage};
 use crate::vpn::{DnsStrategy, VpnConfig, VpnProcess};
 
 const MAX_LOG_LINES: usize = 800;
+const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const LOG_ROTATION_COUNT: usize = 3;
 const MAX_CONNECTION_ROWS: usize = 5_000;
 const PAGE_MAX_WIDTH: f32 = 900.0;
 const WIZARD_STEP_COUNT: usize = 5;
+const ADAPTER_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 
 pub fn run_gui() -> Result<()> {
     let icon = load_icon_data();
@@ -134,6 +137,8 @@ struct NetCombinerApp {
     update_status: String,
     update_busy: bool,
     update_auto_checked: bool,
+    adapter_watch_last: Instant,
+    adapter_alert: Option<String>,
     last_refresh: Option<Instant>,
     started_at: Instant,
     status: AppStatus,
@@ -170,7 +175,7 @@ impl NetCombinerApp {
             adapters: Vec::new(),
             language,
             theme_mode: ThemeMode::Dark,
-            mode: Mode::Proxy,
+            mode: Mode::Vpn,
             wizard_step: 0,
             show_all_adapters: false,
             show_advanced: false,
@@ -209,6 +214,8 @@ impl NetCombinerApp {
             update_status: update_idle_status(language).to_owned(),
             update_busy: false,
             update_auto_checked: false,
+            adapter_watch_last: Instant::now(),
+            adapter_alert: None,
             last_refresh: None,
             started_at: Instant::now(),
             status: AppStatus::Idle,
@@ -367,6 +374,7 @@ impl NetCombinerApp {
             Ok(proxy) => {
                 self.proxy = Some(proxy);
                 self.status = AppStatus::ProxyRunning;
+                self.adapter_watch_last = Instant::now();
             }
             Err(error) => self.push_log(format!("cannot start proxy: {error}")),
         }
@@ -404,6 +412,7 @@ impl NetCombinerApp {
             Ok(process) => {
                 self.vpn = Some(process);
                 self.status = AppStatus::VpnRunning;
+                self.adapter_watch_last = Instant::now();
             }
             Err(error) => self.push_log(format!("cannot start VPN sidecar: {error}")),
         }
@@ -466,6 +475,7 @@ impl NetCombinerApp {
 
         self.sync_tray_language();
         self.poll_update_messages();
+        self.poll_selected_adapter_changes();
         if !self.update_auto_checked && self.started_at.elapsed() >= Duration::from_secs(2) {
             self.update_auto_checked = true;
             self.start_update_check();
@@ -516,9 +526,133 @@ impl NetCombinerApp {
             let _ = file.flush();
         }
         self.logs.push_back(line);
+        self.trim_memory_logs();
+        self.rotate_log_file_if_needed();
+    }
+
+    fn trim_memory_logs(&mut self) {
         while self.logs.len() > MAX_LOG_LINES {
             self.logs.pop_front();
         }
+    }
+
+    fn push_internal_log_line(&mut self, line: String) {
+        self.logs.push_back(line);
+        self.trim_memory_logs();
+    }
+
+    fn rotate_log_file_if_needed(&mut self) {
+        let Some(file) = self.log_file.as_ref() else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if metadata.len() <= MAX_LOG_FILE_BYTES {
+            return;
+        }
+
+        self.log_file = None;
+        let result = rotate_log_if_large(&self.log_path)
+            .and_then(|_| ensure_utf8_bom(&self.log_path))
+            .and_then(|_| open_log_handle(&self.log_path));
+        match result {
+            Ok(file) => {
+                self.log_file = Some(file);
+                self.push_internal_log_line(format!(
+                    "[{}] log file rotated after reaching {} MiB",
+                    log_timestamp(),
+                    MAX_LOG_FILE_BYTES / 1024 / 1024
+                ));
+            }
+            Err(error) => {
+                self.push_internal_log_line(format!(
+                    "[{}] log rotation failed: {error}",
+                    log_timestamp()
+                ));
+            }
+        }
+    }
+
+    fn poll_selected_adapter_changes(&mut self) {
+        if !self.is_running() || self.adapter_watch_last.elapsed() < ADAPTER_WATCH_INTERVAL {
+            return;
+        }
+        self.adapter_watch_last = Instant::now();
+        self.check_selected_adapter_presence();
+    }
+
+    fn check_selected_adapter_presence(&mut self) {
+        let selected = self
+            .adapters
+            .iter()
+            .filter(|row| row.selected)
+            .map(|row| {
+                (
+                    row.adapter.stable_id(),
+                    format!("{} ({})", row.adapter.name, row.adapter.ip),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if selected.is_empty() {
+            self.stop_after_adapter_change(match self.language {
+                Language::English => {
+                    "No selected adapters remain. Proxy/VPN was stopped.".to_owned()
+                }
+                Language::Korean => {
+                    "선택된 어댑터가 없습니다. 프록시/VPN을 중지했습니다.".to_owned()
+                }
+            });
+            return;
+        }
+
+        match crate::adapter::list_adapters() {
+            Ok(current) => {
+                let current_ids = current
+                    .iter()
+                    .map(AdapterAddress::stable_id)
+                    .collect::<HashSet<_>>();
+                let missing = selected
+                    .iter()
+                    .filter(|(id, _)| !current_ids.contains(id))
+                    .map(|(_, label)| label.clone())
+                    .collect::<Vec<_>>();
+
+                if missing.is_empty() {
+                    return;
+                }
+
+                let names = missing.join(", ");
+                let message = match self.language {
+                    Language::English => format!(
+                        "A selected adapter changed or disconnected: {names}. Proxy/VPN was stopped."
+                    ),
+                    Language::Korean => format!(
+                        "선택된 어댑터가 변경되거나 연결 해제되었습니다: {names}. 프록시/VPN을 중지했습니다."
+                    ),
+                };
+                self.stop_after_adapter_change(message);
+            }
+            Err(error) => {
+                let message = match self.language {
+                    Language::English => format!(
+                        "Adapter status could not be checked: {error}. Proxy/VPN was stopped."
+                    ),
+                    Language::Korean => format!(
+                        "어댑터 상태를 확인할 수 없습니다: {error}. 프록시/VPN을 중지했습니다."
+                    ),
+                };
+                self.stop_after_adapter_change(message);
+            }
+        }
+    }
+
+    fn stop_after_adapter_change(&mut self, message: String) {
+        self.stop_all();
+        self.push_log(format!("adapter watchdog: {message}"));
+        self.adapter_alert = Some(message);
+        self.refresh_adapters();
     }
 
     fn apply_connection_event(&mut self, event: proxy::ConnectionEvent) {
@@ -761,6 +895,7 @@ impl eframe::App for NetCombinerApp {
 
         self.draw_connection_monitor_window(ctx, &theme, &t);
         self.draw_tray_options_window(ctx, &theme, &t);
+        self.draw_adapter_alert_window(ctx, &theme, &t);
     }
 }
 
@@ -819,16 +954,36 @@ impl NetCombinerApp {
     }
 
     fn draw_theme_toggle(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let label = match self.theme_mode {
-            ThemeMode::Light => "Light",
-            ThemeMode::Dark => "Dark",
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 30.0), egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        let fill = if response.hovered() {
+            mix(theme.surface_alt, theme.primary_soft, 0.35)
+        } else {
+            theme.surface_alt
         };
-        if pill_button(ui, theme, label, false).clicked() {
+        painter.rect_filled(rect, 100, fill);
+        painter.rect_stroke(
+            rect,
+            100,
+            egui::Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Inside,
+        );
+
+        match self.theme_mode {
+            ThemeMode::Light => draw_moon_icon(&painter, rect.center(), theme.text, fill),
+            ThemeMode::Dark => draw_sun_icon(&painter, rect.center(), theme.text),
+        }
+
+        if response.clicked() {
             self.theme_mode = match self.theme_mode {
                 ThemeMode::Light => ThemeMode::Dark,
                 ThemeMode::Dark => ThemeMode::Light,
             };
         }
+        response.on_hover_text(match self.theme_mode {
+            ThemeMode::Light => "Switch to dark mode",
+            ThemeMode::Dark => "Switch to light mode",
+        });
     }
 
     fn draw_language_toggle(&mut self, ui: &mut egui::Ui, theme: &Theme) {
@@ -1510,11 +1665,14 @@ impl NetCombinerApp {
             });
 
             ui.add_space(20.0);
-            draw_combine_diagram(
+            let diagram_height =
+                (150.0 + self.selected_count().max(1) as f32 * 28.0).clamp(180.0, 380.0);
+            draw_selected_route_diagram(
                 ui,
                 theme,
-                egui::vec2(ui.available_width(), 170.0),
-                self.selected_count().max(3).clamp(3, 8),
+                t,
+                &self.adapters,
+                egui::vec2(ui.available_width(), diagram_height),
             );
 
             if matches!(self.mode, Mode::Vpn) && !running {
@@ -1894,6 +2052,32 @@ impl NetCombinerApp {
             self.allow_exit = true;
             self.stop_all();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn draw_adapter_alert_window(&mut self, ctx: &egui::Context, theme: &Theme, t: &Texts<'_>) {
+        let Some(message) = self.adapter_alert.as_deref() else {
+            return;
+        };
+
+        let mut dismiss = false;
+        egui::Window::new(t.adapter_alert_title)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                wrapped_label(ui, message, 13.0, theme.text);
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(ui, theme, t.adapter_alert_ok, true).clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if dismiss {
+            self.adapter_alert = None;
         }
     }
 
@@ -2731,7 +2915,7 @@ fn draw_combine_diagram(ui: &mut egui::Ui, theme: &Theme, size: egui::Vec2, inpu
     painter.text(
         egui::pos2(left_x, rect.bottom() - 18.0),
         egui::Align2::CENTER_CENTER,
-        format!("SOURCES · {count}"),
+        format!("SOURCES x {count}"),
         egui::FontId::new(10.0, egui::FontFamily::Monospace),
         theme.text_muted,
     );
@@ -2751,6 +2935,138 @@ fn draw_combine_diagram(ui: &mut egui::Ui, theme: &Theme, size: egui::Vec2, inpu
     );
 }
 
+fn draw_selected_route_diagram(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    t: &Texts<'_>,
+    rows: &[AdapterRow],
+    size: egui::Vec2,
+) {
+    let selected = rows.iter().filter(|row| row.selected).collect::<Vec<_>>();
+    let count = selected.len();
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 8, theme.bg);
+    painter.rect_stroke(
+        rect,
+        8,
+        egui::Stroke::new(1.0, theme.border),
+        egui::StrokeKind::Inside,
+    );
+
+    for i in 1..4 {
+        let x = rect.left() + rect.width() * i as f32 / 4.0;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(
+                    theme.border.r(),
+                    theme.border.g(),
+                    theme.border.b(),
+                    70,
+                ),
+            ),
+        );
+    }
+
+    let left_x = rect.left() + 56.0;
+    let merge = egui::pos2(rect.left() + rect.width() * 0.58, rect.center().y);
+    let out = egui::pos2(rect.right() - 56.0, rect.center().y);
+
+    if selected.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            t.adapters_none_selected,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            theme.text_muted,
+        );
+        painter.text(
+            egui::pos2(left_x, rect.bottom() - 18.0),
+            egui::Align2::CENTER_CENTER,
+            "SOURCES x 0",
+            egui::FontId::new(10.0, egui::FontFamily::Monospace),
+            theme.text_muted,
+        );
+        return;
+    }
+
+    let content_top = rect.top() + 36.0;
+    let content_bottom = rect.bottom() - 42.0;
+    let span = (content_bottom - content_top).max(1.0);
+    let mut input_points = Vec::with_capacity(count);
+    for index in 0..count {
+        let ratio = if count == 1 {
+            0.5
+        } else {
+            index as f32 / (count - 1) as f32
+        };
+        input_points.push(egui::pos2(left_x, content_top + span * ratio));
+    }
+
+    for input in &input_points {
+        let control = egui::pos2(rect.left() + rect.width() * 0.36, input.y);
+        let path = cubic_points(*input, control, merge, 32);
+        painter.add(egui::Shape::line(
+            path,
+            egui::Stroke::new(1.4, mix(theme.primary, theme.surface, 0.35)),
+        ));
+    }
+    painter.line_segment([merge, out], egui::Stroke::new(2.2, theme.success));
+
+    for (row, input) in selected.iter().zip(input_points.iter()) {
+        painter.circle_filled(*input, 8.5, theme.surface);
+        painter.circle_stroke(*input, 8.5, egui::Stroke::new(1.8, theme.primary));
+        painter.circle_filled(*input, 3.2, theme.primary);
+
+        let label_x = input.x + 18.0;
+        painter.text(
+            egui::pos2(label_x, input.y - 8.0),
+            egui::Align2::LEFT_CENTER,
+            trim_middle(&row.adapter.name, 18),
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            theme.text,
+        );
+        painter.text(
+            egui::pos2(label_x, input.y + 8.0),
+            egui::Align2::LEFT_CENTER,
+            row.adapter.ip.to_string(),
+            egui::FontId::new(10.0, egui::FontFamily::Monospace),
+            theme.text_muted,
+        );
+    }
+
+    painter.circle_filled(merge, 12.0, theme.primary);
+    painter.circle_filled(merge, 5.0, theme.surface);
+    painter.circle_filled(out, 10.0, theme.success_soft);
+    painter.circle_stroke(out, 10.0, egui::Stroke::new(1.8, theme.success));
+    painter.circle_filled(out, 4.0, theme.success);
+
+    painter.text(
+        egui::pos2(left_x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        format!("SOURCES x {count}"),
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(merge.x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        "MERGE",
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(out.x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        "SYSTEM",
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
+}
+
 fn draw_logo_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2763,6 +3079,28 @@ fn draw_logo_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
         painter.circle_filled(start, 2.6, theme.primary);
     }
     painter.circle_filled(egui::pos2(rect.right() - 9.0, center.y), 4.5, theme.success);
+}
+
+fn draw_sun_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    painter.circle_stroke(center, 5.0, egui::Stroke::new(1.6, color));
+    for index in 0..8 {
+        let angle = index as f32 * std::f32::consts::TAU / 8.0;
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + dir * 8.0, center + dir * 11.0],
+            egui::Stroke::new(1.4, color),
+        );
+    }
+}
+
+fn draw_moon_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: egui::Color32,
+    cutout: egui::Color32,
+) {
+    painter.circle_filled(center - egui::vec2(1.5, 0.0), 8.0, color);
+    painter.circle_filled(center + egui::vec2(3.0, -2.0), 8.0, cutout);
 }
 
 // =====================================================================
@@ -2994,6 +3332,8 @@ struct Texts<'a> {
     status_proxy_running: &'a str,
     status_vpn_running: &'a str,
     status_adapter_failed: &'a str,
+    adapter_alert_title: &'a str,
+    adapter_alert_ok: &'a str,
 }
 
 impl<'a> Texts<'a> {
@@ -3116,6 +3456,8 @@ impl<'a> Texts<'a> {
                 status_proxy_running: "프록시 실행 중",
                 status_vpn_running: "VPN 실행 중",
                 status_adapter_failed: "어댑터 새로고침 실패",
+                adapter_alert_title: "어댑터 연결 변경",
+                adapter_alert_ok: "확인",
             },
             Language::English => Self {
                 tagline: "Combine multiple network adapters into one virtual exit.",
@@ -3234,6 +3576,8 @@ impl<'a> Texts<'a> {
                 status_proxy_running: "Proxy running",
                 status_vpn_running: "VPN running",
                 status_adapter_failed: "Adapter refresh failed",
+                adapter_alert_title: "Adapter connection changed",
+                adapter_alert_ok: "OK",
             },
         }
     }
@@ -3336,7 +3680,7 @@ fn open_log_file() -> (PathBuf, Option<fs::File>, Option<String>) {
         }
         rotate_log_if_large(&path)?;
         ensure_utf8_bom(&path)?;
-        fs::OpenOptions::new().create(true).append(true).open(&path)
+        open_log_handle(&path)
     })();
 
     match result {
@@ -3352,17 +3696,39 @@ fn open_log_file() -> (PathBuf, Option<fs::File>, Option<String>) {
     }
 }
 
+fn open_log_handle(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
 fn rotate_log_if_large(path: &Path) -> std::io::Result<()> {
-    const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
-    if !path.exists() || path.metadata()?.len() <= MAX_LOG_BYTES {
+    if !path.exists() || path.metadata()?.len() <= MAX_LOG_FILE_BYTES {
         return Ok(());
     }
-    let rotated = path.with_extension("log.1");
-    if rotated.exists() {
-        fs::remove_file(&rotated)?;
+
+    for index in (1..=LOG_ROTATION_COUNT).rev() {
+        let source = if index == 1 {
+            path.to_path_buf()
+        } else {
+            rotated_log_path(path, index - 1)
+        };
+        if !source.exists() {
+            continue;
+        }
+        let destination = rotated_log_path(path, index);
+        if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        fs::rename(source, destination)?;
     }
-    fs::rename(path, rotated)?;
     Ok(())
+}
+
+fn rotated_log_path(path: &Path, index: usize) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("net-combiner.log");
+    path.with_file_name(format!("{file_name}.{index}"))
 }
 
 fn ensure_utf8_bom(path: &Path) -> std::io::Result<()> {

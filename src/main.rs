@@ -4,6 +4,7 @@ mod adapter;
 mod admin;
 mod gui;
 mod proxy;
+mod single_instance;
 mod tray;
 mod update;
 mod vpn;
@@ -105,6 +106,18 @@ impl From<CliDnsStrategy> for DnsStrategy {
 fn main() -> Result<()> {
     admin::ensure_elevated()?;
 
+    let cli = Cli::parse();
+    let is_gui = matches!(&cli.command, None | Some(Command::Gui));
+    let _single_instance: Option<single_instance::SingleInstanceGuard> = if is_gui {
+        let guard = single_instance::acquire_or_notify()?;
+        if guard.is_none() {
+            return Ok(());
+        }
+        guard
+    } else {
+        None
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -112,7 +125,6 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Gui) {
         Command::Gui => gui::run_gui(),
         Command::List { json } => list_adapters(json),

@@ -1,13 +1,15 @@
-# net-combiner v0.1.4
+# net-combiner v0.1.5
 
-This release makes update management visible from the main window footer.
+This release tightens the default VPN workflow and adds runtime safeguards for long-running desktop use.
 
 ## Changes
 
-- Added a persistent footer with `ivLis-Studio` and the GitHub repository URL.
-- Added a main-window auto-update panel with current version, status, update check, and install controls.
-- Connected the footer controls to the existing GitHub Releases updater so users can install the latest portable release from inside the app.
-- Localized update status messages for English and Korean.
+- Changed the default mode selection to VPN mode.
+- Replaced the theme text toggle with a compact vector icon toggle.
+- Reworked the run-page route graphic so it reflects the actual selected adapter count and selected source names.
+- Added rotating log files capped at 2 MiB, keeping the last three rotated logs beside the active log.
+- Added a Windows single-instance guard. Starting a second GUI instance now shows an alert and exits the new instance.
+- Added a runtime adapter watchdog. If a selected adapter disappears or changes while proxy/VPN is running, net-combiner stops the route and shows an alert.
 
 ## Packages
 

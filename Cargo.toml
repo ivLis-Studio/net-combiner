@@ -1,6 +1,6 @@
 [package]
 name = "net-combiner"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform GUI for combining local network adapters behind a SOCKS proxy and optional local TUN routing."
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
