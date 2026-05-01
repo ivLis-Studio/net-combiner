@@ -1,14 +1,13 @@
-# net-combiner v0.1.6
+# net-combiner v0.1.7
 
-This release fixes unstable large transfers when multiple selected adapters are active.
+This release tightens tray shutdown behavior and makes the updater UI reflect the actual version state more clearly.
 
 ## Changes
 
-- Changed egress selection from per-connection round-robin to sticky routing per destination IP.
-- Kept parallel range/download connections to the same server on the same source adapter, which avoids server-side and local TCP resets caused by changing source IPs mid-download.
-- Preserved adapter failover: if the sticky adapter cannot connect, net-combiner tries the remaining selected adapters.
-- Applied the same sticky destination policy to UDP relay socket selection.
-- Added a startup log line showing the active egress policy.
+- Fixed tray Quit after the main window has been closed to tray.
+- Kept graceful shutdown for the proxy and VPN sidecar before exiting.
+- Disabled the update install action when the latest GitHub release matches the running app version.
+- Changed the update button label to `Up to date` / `최신 상태` when no newer release is available.
 
 ## Packages
 

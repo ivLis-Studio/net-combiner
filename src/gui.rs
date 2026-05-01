@@ -136,6 +136,7 @@ struct NetCombinerApp {
     update_rx: Option<mpsc::Receiver<UpdateMessage>>,
     update_status: String,
     update_busy: bool,
+    update_available: Option<bool>,
     update_auto_checked: bool,
     adapter_watch_last: Instant,
     adapter_alert: Option<String>,
@@ -143,6 +144,7 @@ struct NetCombinerApp {
     started_at: Instant,
     status: AppStatus,
     icon_texture: Option<egui::TextureHandle>,
+    pending_exit_after_restore: bool,
 }
 
 impl NetCombinerApp {
@@ -213,6 +215,7 @@ impl NetCombinerApp {
             update_rx: None,
             update_status: update_idle_status(language).to_owned(),
             update_busy: false,
+            update_available: None,
             update_auto_checked: false,
             adapter_watch_last: Instant::now(),
             adapter_alert: None,
@@ -220,6 +223,7 @@ impl NetCombinerApp {
             started_at: Instant::now(),
             status: AppStatus::Idle,
             icon_texture,
+            pending_exit_after_restore: false,
         };
         if let Some(error) = log_error {
             app.push_log(error);
@@ -722,15 +726,41 @@ impl NetCombinerApp {
                 self.show_connection_window = true;
             }
             TrayEvent::Quit => {
-                self.allow_exit = true;
-                self.stop_all();
-                ctx.send_viewport_cmd_to(
-                    connection_monitor_viewport_id(),
-                    egui::ViewportCommand::Close,
-                );
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.request_full_exit(ctx);
             }
         }
+    }
+
+    fn request_full_exit(&mut self, ctx: &egui::Context) {
+        self.allow_exit = true;
+        self.stop_all();
+        self.show_connection_window = false;
+        self.show_tray_options = false;
+        ctx.send_viewport_cmd_to(
+            connection_monitor_viewport_id(),
+            egui::ViewportCommand::Close,
+        );
+
+        if !self.window_visible {
+            self.window_visible = true;
+            self.pending_exit_after_restore = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+
+    fn finish_pending_exit(&mut self, ctx: &egui::Context) {
+        if !self.pending_exit_after_restore {
+            return;
+        }
+        self.pending_exit_after_restore = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
@@ -787,15 +817,19 @@ impl NetCombinerApp {
             self.update_busy = false;
             match message {
                 UpdateMessage::Check(Ok(info)) => {
+                    self.update_available = Some(info.available);
                     self.update_status = update_check_status(self.language, &info);
                 }
                 UpdateMessage::Check(Err(error)) => {
+                    self.update_available = None;
                     self.update_status = update_error_status(self.language, "check", &error);
                 }
                 UpdateMessage::Install(Ok(status)) => {
+                    self.update_available = Some(false);
                     self.update_status = update_install_status(self.language, &status);
                 }
                 UpdateMessage::Install(Err(error)) => {
+                    self.update_available = Some(true);
                     self.update_status = update_error_status(self.language, "install", &error);
                 }
             }
@@ -807,6 +841,7 @@ impl NetCombinerApp {
             return;
         }
         self.update_busy = true;
+        self.update_available = None;
         self.update_status = update_checking_status(self.language).to_owned();
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
@@ -818,6 +853,9 @@ impl NetCombinerApp {
 
     fn start_update_install(&mut self) {
         if self.update_busy {
+            return;
+        }
+        if !matches!(self.update_available, Some(true)) {
             return;
         }
         self.update_busy = true;
@@ -838,6 +876,7 @@ impl NetCombinerApp {
 impl eframe::App for NetCombinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        self.finish_pending_exit(ctx);
         self.poll_background(ctx);
 
         let theme = Theme::for_mode(self.theme_mode);
@@ -1037,7 +1076,14 @@ impl NetCombinerApp {
             });
 
             columns[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if primary_button(ui, theme, t.update_install, !self.update_busy).clicked() {
+                let install_enabled =
+                    matches!(self.update_available, Some(true)) && !self.update_busy;
+                let install_label = if matches!(self.update_available, Some(false)) {
+                    t.update_current
+                } else {
+                    t.update_install
+                };
+                if primary_button(ui, theme, install_label, install_enabled).clicked() {
                     self.start_update_install();
                 }
                 if pill_button(ui, theme, t.update_check, self.update_busy).clicked() {
@@ -2029,7 +2075,14 @@ impl NetCombinerApp {
                     if pill_button(ui, theme, t.update_check, false).clicked() {
                         self.start_update_check();
                     }
-                    if primary_button(ui, theme, t.update_install, !self.update_busy).clicked() {
+                    let install_enabled =
+                        matches!(self.update_available, Some(true)) && !self.update_busy;
+                    let install_label = if matches!(self.update_available, Some(false)) {
+                        t.update_current
+                    } else {
+                        t.update_install
+                    };
+                    if primary_button(ui, theme, install_label, install_enabled).clicked() {
                         self.start_update_install();
                     }
                 });
@@ -2049,9 +2102,7 @@ impl NetCombinerApp {
         self.show_tray_options = open;
 
         if quit {
-            self.allow_exit = true;
-            self.stop_all();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.request_full_exit(ctx);
         }
     }
 
@@ -3319,6 +3370,7 @@ struct Texts<'a> {
     update_repo: &'a str,
     update_check: &'a str,
     update_install: &'a str,
+    update_current: &'a str,
     language: &'a str,
     theme: &'a str,
     light: &'a str,
@@ -3443,6 +3495,7 @@ impl<'a> Texts<'a> {
                 update_repo: "GitHub 저장소",
                 update_check: "업데이트 확인",
                 update_install: "최신 버전 설치",
+                update_current: "최신 상태",
                 language: "언어",
                 theme: "테마",
                 light: "라이트",
@@ -3563,6 +3616,7 @@ impl<'a> Texts<'a> {
                 update_repo: "GitHub repo",
                 update_check: "Check updates",
                 update_install: "Install latest",
+                update_current: "Up to date",
                 language: "Language",
                 theme: "Theme",
                 light: "Light",
