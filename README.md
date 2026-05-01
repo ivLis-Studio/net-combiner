@@ -1,6 +1,12 @@
 # net-combiner
 
+![net-combiner banner](assets/readme-banner-en.png)
+
 [한국어](README.ko.md)
+
+[![Release](https://img.shields.io/github/v/release/ivLis-Studio/net-combiner?sort=semver)](https://github.com/ivLis-Studio/net-combiner/releases)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-2f80ed)
+[![License](https://img.shields.io/github/license/ivLis-Studio/net-combiner)](LICENSE)
 
 `net-combiner` is a desktop network combiner. It discovers local network
 adapter addresses, lets you choose the links you want to use, and exposes them
@@ -13,6 +19,18 @@ network path easier to drive. Wi-Fi plus Ethernet, USB tethering plus Wi-Fi, or
 several private overlay interfaces can be used from one local endpoint without
 configuring every application by hand.
 
+## Design Model
+
+`net-combiner` works at the connection layer. It does not perform packet bonding
+and does not pretend to create a faster physical interface. Each outbound flow
+is assigned to one selected adapter address that can reach the destination.
+
+That distinction matters. A single TCP transfer is still bounded by the adapter
+that owns that flow. Workloads that open several parallel connections, such as
+browsers, package managers, update clients, and many download managers, can make
+better use of multiple links because separate flows can leave through separate
+adapters.
+
 ## Current Scope
 
 - Native desktop GUI built with Rust and `egui`.
@@ -24,7 +42,7 @@ configuring every application by hand.
   balancing.
 - Local VPN mode through `tun2proxy`.
 - Connection monitor for live target, adapter, state, and byte counters.
-- Per-adapter upload/download totals in the main adapter list.
+- Per-adapter upload/download totals in the run dashboard and main adapter list.
 - Log file rotation with UTF-8 output.
 - English UI by default, Korean UI included.
 - System tray on Windows and macOS.
@@ -53,6 +71,18 @@ the least-loaded weighted adapter.
 VPN mode starts the same proxy and then launches `tun2proxy`. The sidecar owns
 the TUN routing work and forwards captured traffic back into the local SOCKS5
 proxy.
+
+## Traffic Scheduling
+
+| Strategy | Behavior | Good fit |
+| --- | --- | --- |
+| Sticky per destination IP | The same remote IP keeps using the same adapter unless the adapter fails. | Large downloads and services that dislike source-IP changes. |
+| Per connection | Every new outbound connection is eligible for a fresh adapter choice. | Apps that open many independent connections to several targets. |
+
+Both strategies use live adapter load and configured weights when placing new
+connections. The scheduler favors the least-loaded usable adapter, so active
+transfers are less likely to pile onto the same link when another selected link
+is idle.
 
 ## Installation
 
@@ -94,6 +124,13 @@ Default SOCKS5 endpoint:
 ```text
 127.0.0.1:1080
 ```
+
+Mode selection:
+
+| Mode | Use when | Notes |
+| --- | --- | --- |
+| Proxy | The application can be pointed at a SOCKS5 server. | Lowest impact; does not change OS routes. |
+| VPN | You want most local traffic to flow through the combiner. | Requires the TUN sidecar and elevated privileges. |
 
 VPN mode normally requires administrator or root privileges because it creates a
 TUN interface and changes routes. On Windows the application requests elevation
@@ -167,6 +204,16 @@ The updater uses the release assets whose names contain both the target triple
 and `portable`. Release builds embed the repository owner/name at compile time
 from GitHub Actions, so forks can publish their own updater channel without code
 changes.
+
+## Security and Privacy
+
+- The default SOCKS5 endpoint binds to `127.0.0.1`, not a public interface.
+- The proxy is no-auth by design and should stay on loopback unless the network
+  is fully trusted.
+- There is no hosted control plane. Routing decisions and update checks are made
+  locally against the configured GitHub release channel.
+- Logs and connection monitor data are local diagnostics. They may include
+  adapter addresses, remote endpoints, byte counters, and error messages.
 
 ## Operational Notes
 
