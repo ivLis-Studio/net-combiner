@@ -30,11 +30,11 @@ mod platform {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
         DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos,
-        GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, HWND_MESSAGE, IDI_APPLICATION,
-        LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-        RegisterClassW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowLongPtrW,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
-        WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+        GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, IDI_APPLICATION, LoadIconW,
+        MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
+        SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAY: u32 = WM_APP + 31;
@@ -192,7 +192,7 @@ mod platform {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            0 as HWND,
             0 as HMENU,
             instance as HINSTANCE,
             ptr::null::<c_void>(),
@@ -326,6 +326,7 @@ mod platform {
             if command != 0 {
                 send_menu_event(command as usize, runtime);
             }
+            let _ = PostMessageW(hwnd, WM_NULL, 0, 0);
         }
 
         DestroyMenu(menu);

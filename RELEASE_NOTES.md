@@ -1,13 +1,12 @@
-# net-combiner v0.1.2
+# net-combiner v0.1.3
 
-This release focuses on the new wizard UI and cleaner VPN startup behavior.
+This release fixes tray menu handling after the main window is closed to the tray.
 
 ## Changes
 
-- Reworked the main GUI into a compact step-by-step flow based on the new design reference.
-- Fixed the adapter/settings headers so long labels do not collapse into vertical text.
-- Removed animated page effects from the intro and run views to reduce UI stutter.
-- `tun2proxy-bin.exe` is now spawned without a visible console window on Windows.
+- Fixed Windows tray menu actions after closing the main window with `X`.
+- Tray menu commands such as Show, Options, Connection activity, and Quit now continue to work while the main window is hidden.
+- Adjusted close-to-tray event ordering so a restored window is not immediately hidden again by a stale close request.
 
 ## Packages
 

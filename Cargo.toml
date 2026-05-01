@@ -1,6 +1,6 @@
 [package]
 name = "net-combiner"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform GUI for combining local network adapters behind a SOCKS proxy and optional local TUN routing."

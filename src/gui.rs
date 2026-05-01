@@ -710,8 +710,8 @@ impl NetCombinerApp {
 
 impl eframe::App for NetCombinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_background(ctx);
         self.handle_close_request(ctx);
+        self.poll_background(ctx);
 
         let theme = Theme::for_mode(self.theme_mode);
         apply_theme_visuals(ctx, &theme);
