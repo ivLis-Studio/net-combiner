@@ -4,16 +4,20 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapter::EgressTarget;
+
+const CONNECTION_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+const LOAD_BYTE_UNIT: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -21,11 +25,29 @@ pub struct ProxyConfig {
     pub listen_port: u16,
     pub egress: Vec<EgressTarget>,
     pub udp_enabled: bool,
+    pub egress_strategy: EgressStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EgressStrategy {
+    PerConnection,
+    #[default]
+    PerDestination,
+}
+
+impl EgressStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PerConnection => "per-connection load balance",
+            Self::PerDestination => "sticky per destination IP",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     Opened(ConnectionOpened),
+    Updated(ConnectionUpdated),
     Closed(ConnectionClosed),
 }
 
@@ -38,6 +60,13 @@ pub struct ConnectionOpened {
     pub egress_name: String,
     pub egress_ip: IpAddr,
     pub opened_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionUpdated {
+    pub id: String,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -83,12 +112,18 @@ pub async fn run_proxy(
     let local_addr = listener.local_addr()?;
     log_line(&log, format!("SOCKS5 proxy listening on {local_addr}"));
 
-    let pool = Arc::new(WeightedPool::new(config.egress.clone()));
+    let pool = Arc::new(WeightedPool::new(
+        config.egress.clone(),
+        config.egress_strategy,
+    ));
     log_line(
         &log,
         format!("selected egress adapters: {}", pool.describe()),
     );
-    log_line(&log, "egress policy: sticky per destination IP");
+    log_line(
+        &log,
+        format!("egress policy: {}", config.egress_strategy.label()),
+    );
 
     let connection_id = Arc::new(AtomicU64::new(1));
     loop {
@@ -155,7 +190,8 @@ async fn handle_client(mut inbound: TcpStream, context: ClientContext) -> Result
     match request.command {
         SocksCommand::Connect => {
             let target_label = request.target.to_string();
-            let (mut outbound, selected) = connect_via_pool(&request.target, &context.pool).await?;
+            let (outbound, selected, remote) =
+                connect_via_pool(&request.target, &context.pool).await?;
             let connection_id = context.id.to_string();
             let egress_name = selected.name.clone();
             let egress_ip = selected.ip;
@@ -182,25 +218,31 @@ async fn handle_client(mut inbound: TcpStream, context: ClientContext) -> Result
                     context.id, egress_name, egress_ip
                 ),
             );
+            context.pool.record_open(remote.ip(), egress_ip);
 
-            let (up_bytes, down_bytes, reason) = tokio::select! {
-                result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {
-                    match result {
-                        Ok((from_client, from_server)) => {
-                            log_line(
-                                &context.log,
-                                format!("#{} closed: {from_client} bytes up, {from_server} bytes down", context.id),
-                            );
-                            (from_client, from_server, "closed".to_owned())
-                        }
-                        Err(error) => {
-                            log_line(&context.log, format!("#{} relay error: {error}", context.id));
-                            (0, 0, format!("relay error: {error}"))
-                        }
-                    }
-                }
-                _ = context.cancel.cancelled() => (0, 0, "cancelled".to_owned()),
-            };
+            let (up_bytes, down_bytes, reason) = relay_tcp(
+                inbound,
+                outbound,
+                TcpRelayContext {
+                    id: connection_id.clone(),
+                    cancel: context.cancel,
+                    monitor: context.monitor.clone(),
+                    pool: context.pool.clone(),
+                    remote_ip: remote.ip(),
+                    egress_ip,
+                },
+            )
+            .await;
+            context
+                .pool
+                .record_close(remote.ip(), egress_ip, up_bytes + down_bytes);
+            log_line(
+                &context.log,
+                format!(
+                    "#{} closed: {up_bytes} bytes up, {down_bytes} bytes down ({reason})",
+                    context.id
+                ),
+            );
             emit_connection(
                 &context.monitor,
                 ConnectionEvent::Closed(ConnectionClosed {
@@ -334,7 +376,7 @@ async fn write_reply(stream: &mut TcpStream, code: u8, bind: SocketAddr) -> Resu
 async fn connect_via_pool(
     target: &SocksTarget,
     pool: &WeightedPool,
-) -> Result<(TcpStream, EgressTarget)> {
+) -> Result<(TcpStream, EgressTarget, SocketAddr)> {
     let candidates = resolve_target(target, pool).await?;
     let mut last_error: Option<anyhow::Error> = None;
 
@@ -349,7 +391,7 @@ async fn connect_via_pool(
         }
         for selected in selections {
             match connect_bound(selected.ip, remote).await {
-                Ok(stream) => return Ok((stream, selected)),
+                Ok(stream) => return Ok((stream, selected, remote)),
                 Err(error) => {
                     last_error = Some(anyhow!(
                         "failed to connect {remote} via {} ({}): {error}",
@@ -362,6 +404,145 @@ async fn connect_via_pool(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("target did not resolve to a usable address")))
+}
+
+struct TcpRelayContext {
+    id: String,
+    cancel: CancellationToken,
+    monitor: Option<mpsc::Sender<ConnectionEvent>>,
+    pool: Arc<WeightedPool>,
+    remote_ip: IpAddr,
+    egress_ip: IpAddr,
+}
+
+async fn relay_tcp(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    context: TcpRelayContext,
+) -> (u64, u64, String) {
+    let (client_read, client_write) = inbound.into_split();
+    let (server_read, server_write) = outbound.into_split();
+
+    let up_counter = Arc::new(AtomicU64::new(0));
+    let down_counter = Arc::new(AtomicU64::new(0));
+    let mut up_task = tokio::spawn(copy_counted(client_read, server_write, up_counter.clone()));
+    let mut down_task = tokio::spawn(copy_counted(
+        server_read,
+        client_write,
+        down_counter.clone(),
+    ));
+    let mut up_done = false;
+    let mut down_done = false;
+    let mut last_recorded_total = 0_u64;
+    let mut ticker = tokio::time::interval(CONNECTION_UPDATE_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = context.cancel.cancelled() => {
+                up_task.abort();
+                down_task.abort();
+                let (up, down) = emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+                return (up, down, "cancelled".to_owned());
+            }
+            _ = ticker.tick() => {
+                emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+            }
+            result = &mut up_task, if !up_done => {
+                match copy_task_result(result) {
+                    Ok(_) => {
+                        up_done = true;
+                        emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+                    }
+                    Err(error) => {
+                        down_task.abort();
+                        let (up, down) = emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+                        return (up, down, format!("relay error: {error}"));
+                    }
+                }
+            }
+            result = &mut down_task, if !down_done => {
+                match copy_task_result(result) {
+                    Ok(_) => {
+                        down_done = true;
+                        emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+                    }
+                    Err(error) => {
+                up_task.abort();
+                        let (up, down) = emit_transfer_snapshot(&context, &up_counter, &down_counter, &mut last_recorded_total);
+                        return (up, down, format!("relay error: {error}"));
+                    }
+                }
+            }
+        }
+
+        if up_done && down_done {
+            let (up, down) = emit_transfer_snapshot(
+                &context,
+                &up_counter,
+                &down_counter,
+                &mut last_recorded_total,
+            );
+            return (up, down, "closed".to_owned());
+        }
+    }
+}
+
+async fn copy_counted<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counter: Arc<AtomicU64>,
+) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 32 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+        writer.write_all(&buffer[..read]).await?;
+        total += read as u64;
+        counter.store(total, Ordering::Relaxed);
+    }
+}
+
+fn copy_task_result(result: std::result::Result<io::Result<u64>, JoinError>) -> io::Result<u64> {
+    match result {
+        Ok(value) => value,
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+fn emit_transfer_snapshot(
+    context: &TcpRelayContext,
+    up_counter: &AtomicU64,
+    down_counter: &AtomicU64,
+    last_recorded_total: &mut u64,
+) -> (u64, u64) {
+    let up = up_counter.load(Ordering::Relaxed);
+    let down = down_counter.load(Ordering::Relaxed);
+    let total = up + down;
+    if total > *last_recorded_total {
+        context.pool.record_transfer(
+            context.remote_ip,
+            context.egress_ip,
+            total - *last_recorded_total,
+        );
+        *last_recorded_total = total;
+    }
+    emit_connection(
+        &context.monitor,
+        ConnectionEvent::Updated(ConnectionUpdated {
+            id: context.id.clone(),
+            up_bytes: up,
+            down_bytes: down,
+        }),
+    );
+    (up, down)
 }
 
 async fn resolve_target(target: &SocksTarget, pool: &WeightedPool) -> Result<Vec<SocketAddr>> {
@@ -419,11 +600,29 @@ struct UdpRelayContext {
     id: u64,
     relay: Arc<UdpSocket>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
-    mappings: Arc<AsyncMutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+    mappings: Arc<AsyncMutex<HashMap<SocketAddr, Arc<UdpFlow>>>>,
     pool: Arc<WeightedPool>,
     log: mpsc::Sender<String>,
     monitor: Option<mpsc::Sender<ConnectionEvent>>,
     cancel: CancellationToken,
+}
+
+struct UdpFlow {
+    socket: Arc<UdpSocket>,
+    egress_ip: IpAddr,
+    up_bytes: AtomicU64,
+    down_bytes: AtomicU64,
+}
+
+struct UdpResponseReaderContext {
+    id: u64,
+    flow: Arc<UdpFlow>,
+    relay: Arc<UdpSocket>,
+    client_addr: Arc<Mutex<Option<SocketAddr>>>,
+    remote: SocketAddr,
+    pool: Arc<WeightedPool>,
+    monitor: Option<mpsc::Sender<ConnectionEvent>>,
+    log: mpsc::Sender<String>,
 }
 
 async fn run_udp_association(mut control: TcpStream, context: UdpAssociationContext) -> Result<()> {
@@ -446,13 +645,13 @@ async fn run_udp_association(mut control: TcpStream, context: UdpAssociationCont
     );
 
     let client_addr = Arc::new(Mutex::new(None::<SocketAddr>));
-    let mappings = Arc::new(AsyncMutex::new(HashMap::<SocketAddr, Arc<UdpSocket>>::new()));
+    let mappings = Arc::new(AsyncMutex::new(HashMap::<SocketAddr, Arc<UdpFlow>>::new()));
     let relay_task = tokio::spawn(run_udp_relay(UdpRelayContext {
         id,
         relay: relay.clone(),
         client_addr,
         mappings: mappings.clone(),
-        pool,
+        pool: pool.clone(),
         log: log.clone(),
         monitor: monitor.clone(),
         cancel: cancel.clone(),
@@ -472,15 +671,21 @@ async fn run_udp_association(mut control: TcpStream, context: UdpAssociationCont
     relay_task.abort();
     let remotes = {
         let guard = mappings.lock().await;
-        guard.keys().copied().collect::<Vec<_>>()
+        guard
+            .iter()
+            .map(|(remote, flow)| (*remote, flow.clone()))
+            .collect::<Vec<_>>()
     };
-    for remote in remotes {
+    for (remote, flow) in remotes {
+        let up_bytes = flow.up_bytes.load(Ordering::Relaxed);
+        let down_bytes = flow.down_bytes.load(Ordering::Relaxed);
+        pool.record_close(remote.ip(), flow.egress_ip, up_bytes + down_bytes);
         emit_connection(
             &monitor,
             ConnectionEvent::Closed(ConnectionClosed {
                 id: udp_flow_id(id, remote),
-                up_bytes: 0,
-                down_bytes: 0,
+                up_bytes,
+                down_bytes,
                 reason: "UDP association closed".to_owned(),
                 closed_at: Instant::now(),
             }),
@@ -505,79 +710,108 @@ async fn run_udp_relay(context: UdpRelayContext) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            received = relay.recv_from(&mut buffer) => {
-                let (length, sender) = received?;
-                if !udp_sender_allowed(&client_addr, sender) {
+        _ = cancel.cancelled() => return Ok(()),
+        received = relay.recv_from(&mut buffer) => {
+            let (length, sender) = received?;
+            if !udp_sender_allowed(&client_addr, sender) {
+                continue;
+            }
+
+            let packet = match parse_udp_packet(&buffer[..length]) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    log_line(&log, format!("#{id} invalid UDP packet: {error}"));
                     continue;
                 }
+            };
 
-                let packet = match parse_udp_packet(&buffer[..length]) {
-                    Ok(packet) => packet,
-                    Err(error) => {
-                        log_line(&log, format!("#{id} invalid UDP packet: {error}"));
-                        continue;
-                    }
-                };
-
-                let targets = match resolve_target(&packet.target, &pool).await {
-                    Ok(targets) => targets,
-                    Err(error) => {
-                        log_line(&log, format!("#{id} UDP resolve failed: {error}"));
-                        continue;
-                    }
-                };
-                let Some(remote) = targets.first().copied() else {
+            let targets = match resolve_target(&packet.target, &pool).await {
+                Ok(targets) => targets,
+                Err(error) => {
+                    log_line(&log, format!("#{id} UDP resolve failed: {error}"));
                     continue;
-                };
+                }
+            };
+            let Some(remote) = targets.first().copied() else {
+                continue;
+            };
 
-                let outbound = {
-                    let mut guard = mappings.lock().await;
-                    if let Some(socket) = guard.get(&remote) {
-                        socket.clone()
-                    } else {
-                        let mut bound = None;
-                        for candidate in pool.ordered_for(remote.ip()) {
-                            match bind_udp_socket(candidate.ip, remote).await {
-                                Ok(socket) => {
+            let flow = {
+                let mut guard = mappings.lock().await;
+                if let Some(flow) = guard.get(&remote) {
+                    flow.clone()
+                } else {
+                    let mut bound = None;
+                    for candidate in pool.ordered_for(remote.ip()) {
+                        match bind_udp_socket(candidate.ip, remote).await {
+                            Ok(socket) => {
                                     bound = Some((candidate, Arc::new(socket)));
                                     break;
-                                }
-                                Err(error) => {
-                                    log_line(
-                                        &log,
-                                        format!(
-                                            "#{id} failed to bind UDP via {} ({}): {error}",
-                                            candidate.name, candidate.ip
-                                        ),
-                                    );
-                                }
+                            }
+                            Err(error) => {
+                                log_line(
+                                    &log,
+                                    format!(
+                                        "#{id} failed to bind UDP via {} ({}): {error}",
+                                        candidate.name, candidate.ip
+                                    ),
+                                );
                             }
                         }
-                        let Some((selected, socket)) = bound else {
-                            continue;
-                        };
-                        log_line(&log, format!("#{id} UDP {remote} via {} ({})", selected.name, selected.ip));
-                        emit_connection(
-                            &monitor,
-                            ConnectionEvent::Opened(ConnectionOpened {
-                                id: udp_flow_id(id, remote),
-                                protocol: ConnectionProtocol::Udp,
-                                client: sender,
-                                target: remote.to_string(),
-                                egress_name: selected.name.clone(),
-                                egress_ip: selected.ip,
-                                opened_at: Instant::now(),
+                    }
+                    let Some((selected, socket)) = bound else {
+                        continue;
+                    };
+                    pool.record_open(remote.ip(), selected.ip);
+                    log_line(&log, format!("#{id} UDP {remote} via {} ({})", selected.name, selected.ip));
+                    let flow = Arc::new(UdpFlow {
+                        socket,
+                        egress_ip: selected.ip,
+                        up_bytes: AtomicU64::new(0),
+                        down_bytes: AtomicU64::new(0),
+                    });
+                    emit_connection(
+                        &monitor,
+                        ConnectionEvent::Opened(ConnectionOpened {
+                            id: udp_flow_id(id, remote),
+                            protocol: ConnectionProtocol::Udp,
+                            client: sender,
+                            target: remote.to_string(),
+                            egress_name: selected.name.clone(),
+                            egress_ip: selected.ip,
+                            opened_at: Instant::now(),
                             }),
                         );
-                        spawn_udp_response_reader(id, socket.clone(), relay.clone(), client_addr.clone(), remote, log.clone());
-                        guard.insert(remote, socket.clone());
-                        socket
+                        spawn_udp_response_reader(UdpResponseReaderContext {
+                            id,
+                            flow: flow.clone(),
+                            relay: relay.clone(),
+                            client_addr: client_addr.clone(),
+                            remote,
+                            pool: pool.clone(),
+                            monitor: monitor.clone(),
+                            log: log.clone(),
+                        });
+                        guard.insert(remote, flow.clone());
+                        flow
                     }
                 };
 
-                if let Err(error) = outbound.send(packet.payload).await {
+                if let Err(error) = flow.socket.send(packet.payload).await {
                     log_line(&log, format!("#{id} UDP send to {remote} failed: {error}"));
+                } else {
+                    let sent = packet.payload.len() as u64;
+                    let up_bytes = flow.up_bytes.fetch_add(sent, Ordering::Relaxed) + sent;
+                    let down_bytes = flow.down_bytes.load(Ordering::Relaxed);
+                    pool.record_transfer(remote.ip(), flow.egress_ip, sent);
+                    emit_connection(
+                        &monitor,
+                        ConnectionEvent::Updated(ConnectionUpdated {
+                            id: udp_flow_id(id, remote),
+                            up_bytes,
+                            down_bytes,
+                        }),
+                    );
                 }
             }
         }
@@ -595,18 +829,21 @@ fn udp_sender_allowed(client_addr: &Arc<Mutex<Option<SocketAddr>>>, sender: Sock
     }
 }
 
-fn spawn_udp_response_reader(
-    id: u64,
-    outbound: Arc<UdpSocket>,
-    relay: Arc<UdpSocket>,
-    client_addr: Arc<Mutex<Option<SocketAddr>>>,
-    remote: SocketAddr,
-    log: mpsc::Sender<String>,
-) {
+fn spawn_udp_response_reader(context: UdpResponseReaderContext) {
     tokio::spawn(async move {
+        let UdpResponseReaderContext {
+            id,
+            flow,
+            relay,
+            client_addr,
+            remote,
+            pool,
+            monitor,
+            log,
+        } = context;
         let mut buffer = vec![0_u8; 65_535];
         loop {
-            let length = match outbound.recv(&mut buffer).await {
+            let length = match flow.socket.recv(&mut buffer).await {
                 Ok(length) => length,
                 Err(error) => {
                     log_line(
@@ -625,6 +862,18 @@ fn spawn_udp_response_reader(
                 log_line(&log, format!("#{id} UDP send to client failed: {error}"));
                 return;
             }
+            let received = length as u64;
+            let up_bytes = flow.up_bytes.load(Ordering::Relaxed);
+            let down_bytes = flow.down_bytes.fetch_add(received, Ordering::Relaxed) + received;
+            pool.record_transfer(remote.ip(), flow.egress_ip, received);
+            emit_connection(
+                &monitor,
+                ConnectionEvent::Updated(ConnectionUpdated {
+                    id: udp_flow_id(id, remote),
+                    up_bytes,
+                    down_bytes,
+                }),
+            );
         }
     });
 }
@@ -778,10 +1027,11 @@ impl fmt::Display for SocksTarget {
 struct WeightedPool {
     v4: Mutex<WeightedState>,
     v6: Mutex<WeightedState>,
+    strategy: EgressStrategy,
 }
 
 impl WeightedPool {
-    fn new(targets: Vec<EgressTarget>) -> Self {
+    fn new(targets: Vec<EgressTarget>, strategy: EgressStrategy) -> Self {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
 
@@ -795,6 +1045,7 @@ impl WeightedPool {
         Self {
             v4: Mutex::new(WeightedState::new(v4)),
             v6: Mutex::new(WeightedState::new(v6)),
+            strategy,
         }
     }
 
@@ -806,7 +1057,40 @@ impl WeightedPool {
         state
             .lock()
             .expect("weighted pool mutex poisoned")
-            .ordered_for(remote_ip)
+            .ordered_for(remote_ip, self.strategy)
+    }
+
+    fn record_open(&self, remote_ip: IpAddr, egress_ip: IpAddr) {
+        let state = match remote_ip {
+            IpAddr::V4(_) => &self.v4,
+            IpAddr::V6(_) => &self.v6,
+        };
+        state
+            .lock()
+            .expect("weighted pool mutex poisoned")
+            .record_open(remote_ip, egress_ip, self.strategy);
+    }
+
+    fn record_transfer(&self, remote_ip: IpAddr, egress_ip: IpAddr, bytes: u64) {
+        let state = match remote_ip {
+            IpAddr::V4(_) => &self.v4,
+            IpAddr::V6(_) => &self.v6,
+        };
+        state
+            .lock()
+            .expect("weighted pool mutex poisoned")
+            .record_transfer(remote_ip, egress_ip, bytes);
+    }
+
+    fn record_close(&self, remote_ip: IpAddr, egress_ip: IpAddr, bytes: u64) {
+        let state = match remote_ip {
+            IpAddr::V4(_) => &self.v4,
+            IpAddr::V6(_) => &self.v6,
+        };
+        state
+            .lock()
+            .expect("weighted pool mutex poisoned")
+            .record_close(remote_ip, egress_ip, bytes, self.strategy);
     }
 
     fn has_family(&self, remote_ip: IpAddr) -> bool {
@@ -846,6 +1130,9 @@ impl WeightedPool {
 #[derive(Debug)]
 struct WeightedState {
     entries: Vec<WeightedEntry>,
+    destination_map: HashMap<IpAddr, usize>,
+    destination_refs: HashMap<IpAddr, u64>,
+    cursor: usize,
 }
 
 impl WeightedState {
@@ -854,10 +1141,15 @@ impl WeightedState {
             entries: targets
                 .into_iter()
                 .map(|target| WeightedEntry {
-                    weight: i64::from(target.weight.max(1)),
+                    weight: u64::from(target.weight.max(1)),
+                    active_connections: 0,
+                    active_bytes: 0,
                     target,
                 })
                 .collect(),
+            destination_map: HashMap::new(),
+            destination_refs: HashMap::new(),
+            cursor: 0,
         }
     }
 
@@ -865,29 +1157,102 @@ impl WeightedState {
         self.entries.len()
     }
 
-    fn ordered_for(&self, remote_ip: IpAddr) -> Vec<EgressTarget> {
+    fn ordered_for(&mut self, remote_ip: IpAddr, strategy: EgressStrategy) -> Vec<EgressTarget> {
         if self.entries.is_empty() {
             return Vec::new();
         }
 
-        let total = self.entries.iter().map(|entry| entry.weight).sum::<i64>();
-        let mut slot = (stable_ip_hash(remote_ip) % total as u64) as i64;
-        let mut first_index = 0_usize;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if slot < entry.weight {
-                first_index = index;
-                break;
+        let first_index = match strategy {
+            EgressStrategy::PerDestination => self
+                .destination_map
+                .get(&remote_ip)
+                .copied()
+                .filter(|index| *index < self.entries.len())
+                .unwrap_or_else(|| self.pick_least_loaded()),
+            EgressStrategy::PerConnection => self.pick_least_loaded(),
+        };
+        self.cursor = (first_index + 1) % self.entries.len();
+
+        let mut order = (0..self.entries.len()).collect::<Vec<_>>();
+        order.sort_by_key(|index| {
+            if *index == first_index {
+                (0_u8, 0_u128, 0_usize)
+            } else {
+                (
+                    1_u8,
+                    self.load_score(*index),
+                    ring_distance(first_index, *index, self.entries.len()),
+                )
             }
-            slot -= entry.weight;
+        });
+        order
+            .into_iter()
+            .map(|index| self.entries[index].target.clone())
+            .collect()
+    }
+
+    fn pick_least_loaded(&self) -> usize {
+        (0..self.entries.len())
+            .min_by_key(|index| {
+                (
+                    self.load_score(*index),
+                    ring_distance(self.cursor, *index, self.entries.len()),
+                )
+            })
+            .unwrap_or(0)
+    }
+
+    fn load_score(&self, index: usize) -> u128 {
+        let entry = &self.entries[index];
+        let normalized_active = u128::from(entry.active_connections) * 1_000_000;
+        let normalized_bytes = u128::from(entry.active_bytes / LOAD_BYTE_UNIT);
+        (normalized_active + normalized_bytes) / u128::from(entry.weight.max(1))
+    }
+
+    fn record_open(&mut self, remote_ip: IpAddr, egress_ip: IpAddr, strategy: EgressStrategy) {
+        if let Some(index) = self.index_for(egress_ip) {
+            self.entries[index].active_connections += 1;
+            if matches!(strategy, EgressStrategy::PerDestination) {
+                self.destination_map.insert(remote_ip, index);
+                *self.destination_refs.entry(remote_ip).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn record_transfer(&mut self, _remote_ip: IpAddr, egress_ip: IpAddr, bytes: u64) {
+        if let Some(index) = self.index_for(egress_ip) {
+            self.entries[index].active_bytes =
+                self.entries[index].active_bytes.saturating_add(bytes);
+        }
+    }
+
+    fn record_close(
+        &mut self,
+        remote_ip: IpAddr,
+        egress_ip: IpAddr,
+        bytes: u64,
+        strategy: EgressStrategy,
+    ) {
+        if let Some(index) = self.index_for(egress_ip) {
+            self.entries[index].active_connections =
+                self.entries[index].active_connections.saturating_sub(1);
+            self.entries[index].active_bytes =
+                self.entries[index].active_bytes.saturating_sub(bytes);
         }
 
-        (0..self.entries.len())
-            .map(|offset| {
-                self.entries[(first_index + offset) % self.entries.len()]
-                    .target
-                    .clone()
-            })
-            .collect()
+        if matches!(strategy, EgressStrategy::PerDestination) {
+            if let Some(count) = self.destination_refs.get_mut(&remote_ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.destination_refs.remove(&remote_ip);
+                    self.destination_map.remove(&remote_ip);
+                }
+            }
+        }
+    }
+
+    fn index_for(&self, ip: IpAddr) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.target.ip == ip)
     }
 
     fn describe(&self) -> Vec<String> {
@@ -906,21 +1271,17 @@ impl WeightedState {
 #[derive(Debug)]
 struct WeightedEntry {
     target: EgressTarget,
-    weight: i64,
+    weight: u64,
+    active_connections: u64,
+    active_bytes: u64,
 }
 
-fn stable_ip_hash(ip: IpAddr) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let bytes: Vec<u8> = match ip {
-        IpAddr::V4(addr) => addr.octets().to_vec(),
-        IpAddr::V6(addr) => addr.octets().to_vec(),
-    };
-
-    bytes.into_iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
+fn ring_distance(start: usize, index: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (index + len - start) % len
+    }
 }
 
 fn family_name(ip: IpAddr) -> &'static str {

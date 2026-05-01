@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 
 use crate::adapter::EgressTarget;
-use crate::proxy::ProxyConfig;
+use crate::proxy::{EgressStrategy, ProxyConfig};
 use crate::vpn::{DnsStrategy, VpnConfig};
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,9 @@ enum Command {
         /// Disable SOCKS5 UDP ASSOCIATE support.
         #[arg(long)]
         no_udp: bool,
+        /// Adapter selection strategy.
+        #[arg(long, value_enum, default_value_t = CliEgressStrategy::PerDestination)]
+        strategy: CliEgressStrategy,
     },
     /// Start the proxy and launch the local TUN sidecar.
     Vpn {
@@ -83,6 +86,9 @@ enum Command {
         /// Disable SOCKS5 UDP ASSOCIATE support.
         #[arg(long)]
         no_udp: bool,
+        /// Adapter selection strategy.
+        #[arg(long, value_enum, default_value_t = CliEgressStrategy::PerDestination)]
+        strategy: CliEgressStrategy,
     },
 }
 
@@ -93,12 +99,27 @@ enum CliDnsStrategy {
     Direct,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEgressStrategy {
+    PerConnection,
+    PerDestination,
+}
+
 impl From<CliDnsStrategy> for DnsStrategy {
     fn from(value: CliDnsStrategy) -> Self {
         match value {
             CliDnsStrategy::Virtual => DnsStrategy::Virtual,
             CliDnsStrategy::OverTcp => DnsStrategy::OverTcp,
             CliDnsStrategy::Direct => DnsStrategy::Direct,
+        }
+    }
+}
+
+impl From<CliEgressStrategy> for EgressStrategy {
+    fn from(value: CliEgressStrategy) -> Self {
+        match value {
+            CliEgressStrategy::PerConnection => EgressStrategy::PerConnection,
+            CliEgressStrategy::PerDestination => EgressStrategy::PerDestination,
         }
     }
 }
@@ -133,7 +154,8 @@ fn main() -> Result<()> {
             port,
             egress,
             no_udp,
-        } => run_proxy_foreground(bind, port, egress, !no_udp),
+            strategy,
+        } => run_proxy_foreground(bind, port, egress, !no_udp, strategy.into()),
         Command::Vpn {
             bind,
             port,
@@ -144,6 +166,7 @@ fn main() -> Result<()> {
             dns,
             ipv6,
             no_udp,
+            strategy,
         } => run_vpn_foreground(
             bind,
             port,
@@ -154,6 +177,7 @@ fn main() -> Result<()> {
             dns.into(),
             ipv6,
             !no_udp,
+            strategy.into(),
         ),
     }
 }
@@ -196,12 +220,14 @@ fn run_proxy_foreground(
     port: u16,
     egress: Vec<String>,
     udp_enabled: bool,
+    egress_strategy: EgressStrategy,
 ) -> Result<()> {
     let config = ProxyConfig {
         listen_ip: bind,
         listen_port: port,
         egress: parse_egress_args(&egress)?,
         udp_enabled,
+        egress_strategy,
     };
     let (tx, rx) = mpsc::channel();
     spawn_log_printer(rx);
@@ -234,12 +260,14 @@ fn run_vpn_foreground(
     dns: DnsStrategy,
     ipv6: bool,
     udp_enabled: bool,
+    egress_strategy: EgressStrategy,
 ) -> Result<()> {
     let proxy_config = ProxyConfig {
         listen_ip: bind,
         listen_port: port,
         egress: parse_egress_args(&egress)?,
         udp_enabled,
+        egress_strategy,
     };
     let vpn_config = VpnConfig {
         tun2proxy_path: tun2proxy,

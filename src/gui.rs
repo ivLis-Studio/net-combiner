@@ -107,6 +107,7 @@ struct NetCombinerApp {
     listen_ip: String,
     listen_port: String,
     udp_enabled: bool,
+    egress_strategy: proxy::EgressStrategy,
     setup_routes: bool,
     enable_ipv6: bool,
     dns_strategy: DnsStrategy,
@@ -184,6 +185,7 @@ impl NetCombinerApp {
             listen_ip: "127.0.0.1".to_owned(),
             listen_port: "1080".to_owned(),
             udp_enabled: true,
+            egress_strategy: proxy::EgressStrategy::PerDestination,
             setup_routes: true,
             enable_ipv6: false,
             dns_strategy: DnsStrategy::Virtual,
@@ -316,6 +318,7 @@ impl NetCombinerApp {
             listen_port,
             egress,
             udp_enabled: self.udp_enabled,
+            egress_strategy: self.egress_strategy,
         })
     }
 
@@ -665,6 +668,12 @@ impl NetCombinerApp {
                 self.connections.retain(|row| row.id != opened.id);
                 self.connections.push_front(ConnectionRow::from(opened));
             }
+            proxy::ConnectionEvent::Updated(updated) => {
+                if let Some(row) = self.connections.iter_mut().find(|row| row.id == updated.id) {
+                    row.up_bytes = updated.up_bytes;
+                    row.down_bytes = updated.down_bytes;
+                }
+            }
             proxy::ConnectionEvent::Closed(closed) => {
                 if let Some(row) = self.connections.iter_mut().find(|row| row.id == closed.id) {
                     row.up_bytes = closed.up_bytes;
@@ -712,6 +721,15 @@ impl NetCombinerApp {
                 row.reason = reason.to_owned();
             }
         }
+    }
+
+    fn adapter_totals(&self, adapter_ip: IpAddr) -> (u64, u64) {
+        self.connections
+            .iter()
+            .filter(|row| row.egress_ip == adapter_ip)
+            .fold((0_u64, 0_u64), |(up, down), row| {
+                (up + row.up_bytes, down + row.down_bytes)
+            })
     }
 
     fn handle_tray_event(&mut self, ctx: &egui::Context, event: TrayEvent) {
@@ -1297,6 +1315,7 @@ impl NetCombinerApp {
     }
 
     fn draw_adapter_card(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>, index: usize) {
+        let (adapter_up, adapter_down) = self.adapter_totals(self.adapters[index].adapter.ip);
         let row = &mut self.adapters[index];
         let selected = row.selected;
         let fill = if selected {
@@ -1349,6 +1368,17 @@ impl NetCombinerApp {
                             ui.add_space(8.0);
                         }
                         scope_pill(ui, theme, row.adapter.scope_label());
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "UP {} / DOWN {}",
+                                format_bytes(adapter_up),
+                                format_bytes(adapter_down)
+                            ))
+                            .size(11.5)
+                            .monospace()
+                            .color(theme.text_muted),
+                        );
                         ui.add_space(10.0);
                         draw_sparkline(ui, theme, index, selected);
                     });
@@ -1514,6 +1544,9 @@ impl NetCombinerApp {
         ui.add_space(6.0);
         wrapped_label(ui, t.listen_help, 11.5, theme.text_muted);
 
+        ui.add_space(12.0);
+        self.draw_egress_strategy_settings(ui, theme, t);
+
         if self.show_advanced {
             ui.add_space(14.0);
             divider(ui, theme);
@@ -1554,6 +1587,9 @@ impl NetCombinerApp {
         });
         ui.add_space(2.0);
         wrapped_label(ui, t.dns_help, 11.0, theme.text_muted);
+
+        ui.add_space(12.0);
+        self.draw_egress_strategy_settings(ui, theme, t);
 
         if self.show_advanced {
             ui.add_space(14.0);
@@ -1606,6 +1642,44 @@ impl NetCombinerApp {
             ui.add_space(2.0);
             wrapped_label(ui, t.internal_listen_help, 11.0, theme.text_muted);
         }
+    }
+
+    fn draw_egress_strategy_settings(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+        ui.label(
+            egui::RichText::new(t.egress_strategy)
+                .size(12.5)
+                .strong()
+                .color(theme.text),
+        );
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if pill_button(
+                ui,
+                theme,
+                t.strategy_per_destination,
+                matches!(self.egress_strategy, proxy::EgressStrategy::PerDestination),
+            )
+            .clicked()
+            {
+                self.egress_strategy = proxy::EgressStrategy::PerDestination;
+            }
+            if pill_button(
+                ui,
+                theme,
+                t.strategy_per_connection,
+                matches!(self.egress_strategy, proxy::EgressStrategy::PerConnection),
+            )
+            .clicked()
+            {
+                self.egress_strategy = proxy::EgressStrategy::PerConnection;
+            }
+        });
+        ui.add_space(4.0);
+        let help = match self.egress_strategy {
+            proxy::EgressStrategy::PerDestination => t.strategy_per_destination_help,
+            proxy::EgressStrategy::PerConnection => t.strategy_per_connection_help,
+        };
+        wrapped_label(ui, help, 11.0, theme.text_muted);
     }
 
     fn draw_step_run(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
@@ -3312,6 +3386,11 @@ struct Texts<'a> {
     port: &'a str,
     udp_associate: &'a str,
     udp_associate_help: &'a str,
+    egress_strategy: &'a str,
+    strategy_per_destination: &'a str,
+    strategy_per_connection: &'a str,
+    strategy_per_destination_help: &'a str,
+    strategy_per_connection_help: &'a str,
     configure_routes: &'a str,
     configure_routes_help: &'a str,
     enable_ipv6: &'a str,
@@ -3437,6 +3516,11 @@ impl<'a> Texts<'a> {
                 port: "포트",
                 udp_associate: "SOCKS5 UDP 지원",
                 udp_associate_help: "DNS 조회나 일부 게임에 필요합니다. 켜두는 걸 권장합니다.",
+                egress_strategy: "어댑터 선택 방식",
+                strategy_per_destination: "IP별 고정",
+                strategy_per_connection: "연결마다 분산",
+                strategy_per_destination_help: "같은 목적지 IP는 같은 어댑터를 유지합니다. 새 목적지 IP는 현재 부하가 가장 낮은 어댑터부터 배정합니다.",
+                strategy_per_connection_help: "같은 목적지 IP라도 새 연결마다 현재 부하가 가장 낮은 어댑터부터 시도합니다. 대용량 다운로드가 여러 연결을 열 때 더 공격적으로 분산합니다.",
                 configure_routes: "시스템 라우트 자동 설정",
                 configure_routes_help: "끄면 직접 라우팅 테이블을 설정해야 합니다. 보통은 켜둡니다.",
                 enable_ipv6: "IPv6 라우팅 사용",
@@ -3558,6 +3642,11 @@ impl<'a> Texts<'a> {
                 port: "Port",
                 udp_associate: "Enable SOCKS5 UDP",
                 udp_associate_help: "Needed for DNS and some games. Recommended to keep on.",
+                egress_strategy: "Adapter selection",
+                strategy_per_destination: "Sticky per IP",
+                strategy_per_connection: "Per connection",
+                strategy_per_destination_help: "Keeps the same destination IP on one adapter. New destination IPs are assigned to the least-loaded adapter first.",
+                strategy_per_connection_help: "Allows the same destination IP to use a different adapter for each new connection. This is more aggressive for large downloads that open many parallel flows.",
                 configure_routes: "Auto-configure system routes",
                 configure_routes_help: "Off means you must edit the routing table yourself. Usually leave on.",
                 enable_ipv6: "Enable IPv6 routing",

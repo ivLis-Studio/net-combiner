@@ -20,9 +20,11 @@ configuring every application by hand.
 - Public/private adapter addresses shown by default, with an option to reveal
   link-local and loopback addresses.
 - SOCKS5 no-auth proxy with TCP `CONNECT` and UDP `ASSOCIATE`.
-- Per-connection egress selection with smooth weighted round-robin scheduling.
+- Selectable egress scheduling: sticky per destination IP or per-connection load
+  balancing.
 - Local VPN mode through `tun2proxy`.
 - Connection monitor for live target, adapter, state, and byte counters.
+- Per-adapter upload/download totals in the main adapter list.
 - Log file rotation with UTF-8 output.
 - English UI by default, Korean UI included.
 - System tray on Windows and macOS.
@@ -43,9 +45,10 @@ flowchart LR
 ```
 
 The proxy binds each outbound connection to one of the selected local adapter
-addresses. The scheduler chooses the adapter per connection, not per packet. A
-single TCP connection therefore stays on one adapter, while multiple concurrent
-connections are distributed across the selected links.
+addresses. The scheduler chooses the adapter per connection, not per packet.
+Users can keep a destination IP sticky to one adapter or allow each new
+connection to be balanced independently. In both modes, new assignments prefer
+the least-loaded weighted adapter.
 
 VPN mode starts the same proxy and then launches `tun2proxy`. The sidecar owns
 the TUN routing work and forwards captured traffic back into the local SOCKS5
@@ -152,7 +155,7 @@ a `bin` directory, then on `PATH`.
 Tag a version and push it:
 
 ```powershell
-git tag v0.1.7
+git tag v0.1.8
 git push origin main --tags
 ```
 

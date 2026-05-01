@@ -1,13 +1,15 @@
-# net-combiner v0.1.7
+# net-combiner v0.1.8
 
-This release tightens tray shutdown behavior and makes the updater UI reflect the actual version state more clearly.
+This release improves live traffic visibility and adds selectable load-balancing behavior for large downloads.
 
 ## Changes
 
-- Fixed tray Quit after the main window has been closed to tray.
-- Kept graceful shutdown for the proxy and VPN sidecar before exiting.
-- Disabled the update install action when the latest GitHub release matches the running app version.
-- Changed the update button label to `Up to date` / `최신 상태` when no newer release is available.
+- Connection monitor rows now receive live upload/download byte updates instead of waiting for connection close.
+- TCP relay accounting now preserves transferred bytes even when a relay exits with a socket error.
+- UDP relay flows now report upload/download byte counts as well.
+- Adapter cards show per-adapter upload/download totals for the current run.
+- Added a user-selectable adapter strategy: sticky per destination IP or per-connection load balancing.
+- Reworked adapter selection to prefer the least-loaded weighted adapter by active connections and active traffic, reducing large-download imbalance when servers split traffic across multiple IPs.
 
 ## Packages
 

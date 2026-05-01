@@ -13,9 +13,10 @@
 - 기본 화면에는 public/private 어댑터만 표시하고, 옵션에서 link-local/loopback까지 표시 가능.
 - SOCKS5 no-auth 프록시.
 - TCP `CONNECT` 및 UDP `ASSOCIATE` 지원.
-- 연결 단위 weighted round-robin egress 선택.
+- 목적지 IP별 고정 또는 연결마다 분산 중 선택 가능한 egress 스케줄링.
 - `tun2proxy`를 통한 로컬 VPN 모드.
 - 대상 주소, 사용 어댑터, 상태, 바이트 카운터를 보는 연결 모니터.
+- 메인 어댑터 목록에서 어댑터별 업로드/다운로드 누적량 표시.
 - UTF-8 로그 파일과 로그 회전.
 - 기본 영어 UI, 한국어 UI 포함.
 - Windows 및 macOS 시스템 트레이.
@@ -35,7 +36,7 @@ flowchart LR
     Scheduler --> Nic3["어댑터 주소 C"]
 ```
 
-프록시는 각 outbound 연결을 선택된 로컬 어댑터 주소 중 하나에 bind합니다. 선택은 패킷 단위가 아니라 연결 단위입니다. 따라서 하나의 TCP 연결은 하나의 어댑터를 계속 사용하고, 여러 연결이 동시에 있을 때 선택된 링크들로 분산됩니다.
+프록시는 각 outbound 연결을 선택된 로컬 어댑터 주소 중 하나에 bind합니다. 선택은 패킷 단위가 아니라 연결 단위입니다. 사용자는 목적지 IP를 한 어댑터에 고정하거나, 새 연결마다 독립적으로 분산하도록 선택할 수 있습니다. 두 방식 모두 새 연결은 현재 부하가 가장 낮은 가중치 어댑터부터 시도합니다.
 
 VPN 모드는 같은 프록시를 띄운 뒤 `tun2proxy`를 실행합니다. TUN 인터페이스와 라우팅 처리는 sidecar가 담당하고, 캡처된 트래픽은 로컬 SOCKS5 프록시로 들어옵니다.
 
@@ -131,7 +132,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-local.ps1
 버전 태그를 만들고 push합니다.
 
 ```powershell
-git tag v0.1.7
+git tag v0.1.8
 git push origin main --tags
 ```
 
