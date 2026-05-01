@@ -73,6 +73,7 @@ impl VpnProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        hide_child_console(&mut command);
 
         if config.setup_routes {
             command.arg("--setup");
@@ -117,6 +118,17 @@ impl VpnProcess {
         Ok(())
     }
 }
+
+#[cfg(windows)]
+fn hide_child_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_child_console(_command: &mut Command) {}
 
 fn command_args_for_log(command: &Command) -> Vec<String> {
     command

@@ -18,13 +18,14 @@ use crate::vpn::{DnsStrategy, VpnConfig, VpnProcess};
 
 const MAX_LOG_LINES: usize = 800;
 const MAX_CONNECTION_ROWS: usize = 5_000;
-const PAGE_MAX_WIDTH: f32 = 760.0;
+const PAGE_MAX_WIDTH: f32 = 900.0;
+const WIZARD_STEP_COUNT: usize = 5;
 
 pub fn run_gui() -> Result<()> {
     let icon = load_icon_data();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([880.0, 820.0])
-        .with_min_inner_size([520.0, 580.0]);
+        .with_inner_size([940.0, 860.0])
+        .with_min_inner_size([620.0, 620.0]);
     if let Some(icon) = icon.clone() {
         viewport = viewport.with_icon(icon);
     }
@@ -97,6 +98,7 @@ struct NetCombinerApp {
     language: Language,
     theme_mode: ThemeMode,
     mode: Mode,
+    wizard_step: usize,
     show_all_adapters: bool,
     show_advanced: bool,
     listen_ip: String,
@@ -167,8 +169,9 @@ impl NetCombinerApp {
         let mut app = Self {
             adapters: Vec::new(),
             language,
-            theme_mode: ThemeMode::Light,
+            theme_mode: ThemeMode::Dark,
             mode: Mode::Proxy,
+            wizard_step: 0,
             show_all_adapters: false,
             show_advanced: false,
             listen_ip: "127.0.0.1".to_owned(),
@@ -715,13 +718,13 @@ impl eframe::App for NetCombinerApp {
         let t = Texts::new(self.language);
 
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(64.0)
+            .exact_height(54.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme.surface)
+                    .fill(theme.bg)
                     .inner_margin(egui::Margin {
-                        left: 24,
-                        right: 24,
+                        left: 28,
+                        right: 28,
                         top: 0,
                         bottom: 0,
                     }),
@@ -737,23 +740,11 @@ impl eframe::App for NetCombinerApp {
                     .id_salt("page_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(12.0);
+                        ui.add_space(20.0);
                         self.draw_centered(ui, |app, ui| {
                             app.draw_step_progress(ui, &theme, &t);
-                            ui.add_space(20.0);
-                            app.draw_step_intro(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_step_adapters(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_step_mode(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_step_settings(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_step_run(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_connections_section(ui, &theme, &t);
-                            ui.add_space(16.0);
-                            app.draw_logs_section(ui, &theme, &t);
+                            ui.add_space(28.0);
+                            app.draw_wizard_page(ui, &theme, &t);
                             ui.add_space(28.0);
                         });
                     });
@@ -791,32 +782,28 @@ impl NetCombinerApp {
             if let Some(texture) = &self.icon_texture {
                 ui.add(egui::Image::from_texture((
                     texture.id(),
-                    egui::vec2(30.0, 30.0),
+                    egui::vec2(26.0, 26.0),
                 )));
             } else {
-                draw_logo_mark(ui, theme, 30.0);
+                draw_logo_mark(ui, theme, 26.0);
             }
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(9.0);
                 ui.label(
                     egui::RichText::new("net-combiner")
-                        .size(17.0)
+                        .size(14.0)
                         .strong()
                         .color(theme.text),
-                );
-                ui.label(
-                    egui::RichText::new(t.tagline)
-                        .size(11.5)
-                        .color(theme.text_muted),
-                );
+                )
+                .on_hover_text(t.tagline);
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.draw_theme_toggle(ui, theme);
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 self.draw_language_toggle(ui, theme);
-                ui.add_space(12.0);
+                ui.add_space(8.0);
                 draw_status_pill(ui, theme, &self.status, t, self.is_running());
             });
         });
@@ -824,8 +811,8 @@ impl NetCombinerApp {
 
     fn draw_theme_toggle(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let label = match self.theme_mode {
-            ThemeMode::Light => "🌙",
-            ThemeMode::Dark => "☀",
+            ThemeMode::Light => "Light",
+            ThemeMode::Dark => "Dark",
         };
         if pill_button(ui, theme, label, false).clicked() {
             self.theme_mode = match self.theme_mode {
@@ -838,7 +825,7 @@ impl NetCombinerApp {
     fn draw_language_toggle(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let active_en = matches!(self.language, Language::English);
         ui.horizontal(|ui| {
-            if pill_button(ui, theme, "한국어", !active_en).clicked() {
+            if pill_button(ui, theme, "KO", !active_en).clicked() {
                 self.language = Language::Korean;
             }
             if pill_button(ui, theme, "EN", active_en).clicked() {
@@ -853,7 +840,7 @@ impl NetCombinerApp {
 // =====================================================================
 
 impl NetCombinerApp {
-    fn draw_step_progress(&self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+    fn draw_step_progress(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         let steps = [
             t.step_label_intro,
             t.step_label_adapters,
@@ -863,15 +850,17 @@ impl NetCombinerApp {
         ];
         let current = self.current_step();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (idx, label) in steps.iter().enumerate() {
                 let active = idx == current;
                 let done = idx < current;
-                draw_step_chip(ui, theme, idx + 1, label, active, done);
+                if draw_step_chip(ui, theme, idx, label, active, done).clicked() {
+                    self.wizard_step = idx;
+                }
                 if idx < steps.len() - 1 {
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 2.0), egui::Sense::hover());
-                    let color = if done { theme.primary } else { theme.border };
+                        ui.allocate_exact_size(egui::vec2(22.0, 1.0), egui::Sense::hover());
+                    let color = if done { theme.success } else { theme.border };
                     ui.painter().rect_filled(rect, 1.0, color);
                 }
             }
@@ -879,57 +868,124 @@ impl NetCombinerApp {
     }
 
     fn current_step(&self) -> usize {
-        if self.is_running() {
-            return 4;
+        self.wizard_step.min(WIZARD_STEP_COUNT - 1)
+    }
+
+    fn draw_wizard_page(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+        match self.current_step() {
+            0 => self.draw_step_intro(ui, theme, t),
+            1 => self.draw_step_adapters(ui, theme, t),
+            2 => self.draw_step_mode(ui, theme, t),
+            3 => self.draw_step_settings(ui, theme, t),
+            _ => {
+                self.draw_step_run(ui, theme, t);
+                ui.add_space(16.0);
+                self.draw_connections_section(ui, theme, t);
+                ui.add_space(16.0);
+                self.draw_logs_section(ui, theme, t);
+            }
         }
-        if self.selected_count() == 0 {
-            return 1;
-        }
-        2
+
+        ui.add_space(20.0);
+        self.draw_step_footer(ui, theme);
+    }
+
+    fn draw_step_footer(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        divider(ui, theme);
+        ui.add_space(14.0);
+        let current = self.current_step();
+        ui.columns(3, |columns| {
+            let prev = columns[0].add_enabled(
+                current > 0,
+                egui::Button::new(
+                    egui::RichText::new(format!("< {}", previous_label(self.language)))
+                        .size(13.0)
+                        .color(theme.text),
+                )
+                .fill(theme.bg)
+                .stroke(egui::Stroke::NONE)
+                .min_size(egui::vec2(92.0, 36.0)),
+            );
+            if prev.clicked() {
+                self.wizard_step = current.saturating_sub(1);
+            }
+
+            columns[1].vertical_centered(|ui| {
+                ui.add_space(9.0);
+                ui.label(
+                    egui::RichText::new(format!("{:02} / {:02}", current + 1, WIZARD_STEP_COUNT))
+                        .size(13.0)
+                        .monospace()
+                        .color(theme.text_muted),
+                );
+            });
+
+            columns[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let next = ui.add_enabled(
+                    current + 1 < WIZARD_STEP_COUNT,
+                    egui::Button::new(
+                        egui::RichText::new(format!("{}  >", next_label(self.language)))
+                            .size(13.0)
+                            .strong()
+                            .color(theme.bg),
+                    )
+                    .fill(theme.text)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(96.0, 38.0)),
+                );
+                if next.clicked() {
+                    self.wizard_step = (current + 1).min(WIZARD_STEP_COUNT - 1);
+                }
+            });
+        });
     }
 
     fn draw_step_intro(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         section_card(theme).show(ui, |ui| {
             step_header(ui, theme, 1, t.step1_title, t.step1_subtitle);
-            ui.add_space(12.0);
+            ui.add_space(28.0);
 
             let avail = ui.available_width();
-            let diagram_w = avail.min(560.0);
+            let diagram_w = avail.min(760.0);
             ui.vertical_centered(|ui| {
                 draw_combine_diagram(
                     ui,
                     theme,
-                    self.started_at.elapsed().as_secs_f32(),
-                    egui::vec2(diagram_w, 150.0),
-                    self.selected_count().clamp(2, 4),
+                    egui::vec2(diagram_w, 210.0),
+                    self.selected_count().max(3).clamp(3, 6),
                 );
             });
-            ui.add_space(12.0);
-            bullet_line(ui, theme, t.intro_bullet1);
-            bullet_line(ui, theme, t.intro_bullet2);
-            bullet_line(ui, theme, t.intro_bullet3);
+            ui.add_space(24.0);
+            divider(ui, theme);
+            ui.add_space(18.0);
+            ui.columns(3, |columns| {
+                intro_feature(&mut columns[0], theme, "01", t.intro_bullet1);
+                intro_feature(&mut columns[1], theme, "02", t.intro_bullet2);
+                intro_feature(&mut columns[2], theme, "03", t.intro_bullet3);
+            });
         });
     }
 
     fn draw_step_adapters(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         section_card(theme).show(ui, |ui| {
+            step_header(ui, theme, 2, t.step2_title, t.step2_subtitle);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                step_header(ui, theme, 2, t.step2_title, t.step2_subtitle);
+                if let Some(last) = self.last_refresh {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}s",
+                            t.refreshed_ago,
+                            last.elapsed().as_secs()
+                        ))
+                        .size(11.5)
+                        .color(theme.text_muted),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if pill_button(ui, theme, t.refresh, false).clicked() {
                         self.refresh_adapters();
-                    }
-                    if let Some(last) = self.last_refresh {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} {}s",
-                                t.refreshed_ago,
-                                last.elapsed().as_secs()
-                            ))
-                            .size(11.5)
-                            .color(theme.text_muted),
-                        );
                     }
                 });
             });
@@ -1034,6 +1090,8 @@ impl NetCombinerApp {
                             ui.add_space(8.0);
                         }
                         scope_pill(ui, theme, row.adapter.scope_label());
+                        ui.add_space(10.0);
+                        draw_sparkline(ui, theme, index, selected);
                     });
                     drag_rect
                 })
@@ -1157,12 +1215,13 @@ impl NetCombinerApp {
 
     fn draw_step_settings(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         section_card(theme).show(ui, |ui| {
+            let (title, subtitle) = match self.mode {
+                Mode::Proxy => (t.step4_proxy_title, t.step4_proxy_subtitle),
+                Mode::Vpn => (t.step4_vpn_title, t.step4_vpn_subtitle),
+            };
+            step_header(ui, theme, 4, title, subtitle);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let (title, subtitle) = match self.mode {
-                    Mode::Proxy => (t.step4_proxy_title, t.step4_proxy_subtitle),
-                    Mode::Vpn => (t.step4_vpn_title, t.step4_vpn_subtitle),
-                };
-                step_header(ui, theme, 4, title, subtitle);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let label = if self.show_advanced {
                         t.hide_advanced
@@ -1303,7 +1362,7 @@ impl NetCombinerApp {
 
             // Status row: pulse + title only (no overflow risk)
             ui.horizontal(|ui| {
-                draw_pulse_indicator(ui, theme, self.started_at.elapsed().as_secs_f32(), running);
+                draw_pulse_indicator(ui, theme, running);
                 ui.add_space(12.0);
                 let title = if running {
                     format!("{} / {}", t.status_running, mode_label)
@@ -1359,6 +1418,46 @@ impl NetCombinerApp {
                     }
                 });
             });
+
+            ui.add_space(18.0);
+            divider(ui, theme);
+            ui.add_space(14.0);
+            ui.columns(4, |columns| {
+                run_stat(
+                    &mut columns[0],
+                    theme,
+                    "STATE",
+                    if running {
+                        t.status_running
+                    } else {
+                        t.status_idle
+                    },
+                );
+                run_stat(
+                    &mut columns[1],
+                    theme,
+                    "ENDPOINT",
+                    match self.mode {
+                        Mode::Proxy => "SOCKS5",
+                        Mode::Vpn => "TUN",
+                    },
+                );
+                run_stat(
+                    &mut columns[2],
+                    theme,
+                    "ADAPTERS",
+                    &format!("{} / {}", self.selected_count(), self.adapters.len()),
+                );
+                run_stat(&mut columns[3], theme, "PORT", &self.listen_port);
+            });
+
+            ui.add_space(20.0);
+            draw_combine_diagram(
+                ui,
+                theme,
+                egui::vec2(ui.available_width(), 170.0),
+                self.selected_count().max(3).clamp(3, 8),
+            );
 
             if matches!(self.mode, Mode::Vpn) && !running {
                 ui.add_space(10.0);
@@ -1838,38 +1937,38 @@ impl Theme {
     fn for_mode(mode: ThemeMode) -> Self {
         match mode {
             ThemeMode::Light => Self {
-                bg: egui::Color32::from_rgb(244, 246, 251),
+                bg: egui::Color32::from_rgb(247, 249, 252),
                 surface: egui::Color32::from_rgb(255, 255, 255),
-                surface_alt: egui::Color32::from_rgb(244, 247, 252),
-                border: egui::Color32::from_rgb(225, 231, 240),
-                text: egui::Color32::from_rgb(15, 23, 42),
-                text_muted: egui::Color32::from_rgb(100, 116, 139),
-                primary: egui::Color32::from_rgb(99, 102, 241),
-                primary_soft: egui::Color32::from_rgb(238, 242, 255),
-                success: egui::Color32::from_rgb(16, 185, 129),
-                success_soft: egui::Color32::from_rgb(220, 252, 231),
+                surface_alt: egui::Color32::from_rgb(241, 245, 249),
+                border: egui::Color32::from_rgb(222, 228, 238),
+                text: egui::Color32::from_rgb(18, 24, 38),
+                text_muted: egui::Color32::from_rgb(103, 114, 136),
+                primary: egui::Color32::from_rgb(124, 92, 255),
+                primary_soft: egui::Color32::from_rgb(242, 238, 255),
+                success: egui::Color32::from_rgb(20, 184, 166),
+                success_soft: egui::Color32::from_rgb(221, 252, 247),
                 warning: egui::Color32::from_rgb(217, 119, 6),
-                warning_soft: egui::Color32::from_rgb(254, 243, 199),
+                warning_soft: egui::Color32::from_rgb(255, 247, 214),
                 danger: egui::Color32::from_rgb(220, 38, 38),
                 log_bg: egui::Color32::from_rgb(248, 250, 252),
                 log_text: egui::Color32::from_rgb(51, 65, 85),
             },
             ThemeMode::Dark => Self {
-                bg: egui::Color32::from_rgb(11, 15, 26),
-                surface: egui::Color32::from_rgb(19, 24, 38),
-                surface_alt: egui::Color32::from_rgb(27, 33, 51),
-                border: egui::Color32::from_rgb(43, 53, 76),
-                text: egui::Color32::from_rgb(232, 236, 245),
-                text_muted: egui::Color32::from_rgb(143, 152, 173),
-                primary: egui::Color32::from_rgb(129, 140, 248),
-                primary_soft: egui::Color32::from_rgb(34, 41, 71),
-                success: egui::Color32::from_rgb(52, 211, 153),
-                success_soft: egui::Color32::from_rgb(13, 41, 36),
-                warning: egui::Color32::from_rgb(251, 191, 36),
-                warning_soft: egui::Color32::from_rgb(54, 36, 9),
+                bg: egui::Color32::from_rgb(6, 8, 13),
+                surface: egui::Color32::from_rgb(9, 12, 18),
+                surface_alt: egui::Color32::from_rgb(14, 18, 27),
+                border: egui::Color32::from_rgb(30, 36, 48),
+                text: egui::Color32::from_rgb(237, 241, 248),
+                text_muted: egui::Color32::from_rgb(128, 138, 158),
+                primary: egui::Color32::from_rgb(167, 139, 250),
+                primary_soft: egui::Color32::from_rgb(42, 34, 65),
+                success: egui::Color32::from_rgb(94, 234, 212),
+                success_soft: egui::Color32::from_rgb(18, 56, 53),
+                warning: egui::Color32::from_rgb(245, 158, 11),
+                warning_soft: egui::Color32::from_rgb(62, 42, 13),
                 danger: egui::Color32::from_rgb(248, 113, 113),
-                log_bg: egui::Color32::from_rgb(13, 18, 30),
-                log_text: egui::Color32::from_rgb(190, 200, 220),
+                log_bg: egui::Color32::from_rgb(4, 6, 10),
+                log_text: egui::Color32::from_rgb(177, 186, 205),
             },
         }
     }
@@ -1956,43 +2055,58 @@ fn section_card(theme: &Theme) -> egui::Frame {
     egui::Frame::new()
         .fill(theme.surface)
         .stroke(egui::Stroke::new(1.0, theme.border))
-        .corner_radius(12)
-        .inner_margin(egui::Margin::same(20))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(28))
         .shadow(egui::Shadow {
-            offset: [0, 2],
-            blur: 12,
+            offset: [0, 0],
+            blur: 0,
             spread: 0,
-            color: egui::Color32::from_black_alpha(8),
+            color: egui::Color32::TRANSPARENT,
         })
 }
 
 fn step_header(ui: &mut egui::Ui, theme: &Theme, number: usize, title: &str, subtitle: &str) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(rect.center(), 14.0, theme.primary_soft);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            number.to_string(),
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            theme.primary,
-        );
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .size(16.0)
-                    .strong()
-                    .color(theme.text),
-            );
-            ui.label(
-                egui::RichText::new(subtitle)
-                    .size(12.0)
-                    .color(theme.text_muted),
-            );
-        });
-    });
+    ui.label(
+        egui::RichText::new(format!("{:02}  {}", number - 1, step_code(number)))
+            .size(11.0)
+            .monospace()
+            .strong()
+            .color(theme.text_muted),
+    );
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new(title)
+            .size(28.0)
+            .strong()
+            .color(theme.text),
+    );
+    ui.add_space(8.0);
+    wrapped_label(ui, subtitle, 14.0, theme.text_muted);
+}
+
+fn step_code(number: usize) -> &'static str {
+    match number {
+        1 => "OVERVIEW",
+        2 => "ADAPTERS",
+        3 => "MODE",
+        4 => "SETTINGS",
+        5 => "RUN",
+        _ => "STEP",
+    }
+}
+
+fn previous_label(language: Language) -> &'static str {
+    match language {
+        Language::English => "Back",
+        Language::Korean => "이전",
+    }
+}
+
+fn next_label(language: Language) -> &'static str {
+    match language {
+        Language::English => "Next",
+        Language::Korean => "다음",
+    }
 }
 
 fn draw_step_chip(
@@ -2002,55 +2116,86 @@ fn draw_step_chip(
     label: &str,
     active: bool,
     done: bool,
-) {
-    let (fill, fg) = if active {
-        (theme.primary, egui::Color32::WHITE)
+) -> egui::Response {
+    let (fill, fg, stroke) = if active {
+        (
+            theme.primary_soft,
+            theme.text,
+            egui::Stroke::new(1.0, theme.primary),
+        )
     } else if done {
-        (theme.success_soft, theme.success)
+        (
+            theme.success_soft,
+            theme.success,
+            egui::Stroke::new(1.0, mix(theme.success, theme.border, 0.45)),
+        )
     } else {
-        (theme.surface_alt, theme.text_muted)
+        (
+            theme.bg,
+            theme.text_muted,
+            egui::Stroke::new(1.0, theme.border),
+        )
     };
-    egui::Frame::new()
+    let response = egui::Frame::new()
         .fill(fill)
         .corner_radius(100)
-        .inner_margin(egui::Margin::symmetric(10, 5))
-        .stroke(egui::Stroke::new(1.0, theme.border))
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .stroke(stroke)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let badge = if done {
-                    "✓".to_string()
+                    "OK".to_string()
                 } else {
-                    number.to_string()
+                    format!("{number:02}")
                 };
-                ui.label(egui::RichText::new(badge).size(11.5).strong().color(fg));
-                ui.label(egui::RichText::new(label).size(11.5).color(fg));
+                ui.label(
+                    egui::RichText::new(badge)
+                        .size(11.0)
+                        .monospace()
+                        .strong()
+                        .color(fg),
+                );
+                ui.label(egui::RichText::new(label).size(12.0).strong().color(fg));
             });
-        });
+        })
+        .response;
+    ui.interact(response.rect, response.id, egui::Sense::click())
 }
 
-fn bullet_line(ui: &mut egui::Ui, theme: &Theme, text: &str) {
-    let avail = ui.available_width();
-    ui.horizontal_top(|ui| {
-        ui.add_space(2.0);
+fn intro_feature(ui: &mut egui::Ui, theme: &Theme, number: &str, text: &str) {
+    ui.vertical(|ui| {
         ui.label(
-            egui::RichText::new("•")
-                .size(13.0)
+            egui::RichText::new(number)
+                .size(11.0)
+                .monospace()
                 .strong()
                 .color(theme.primary),
         );
         ui.add_space(6.0);
-        let text_width = (avail - 24.0).max(120.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(text_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(text).size(12.5).color(theme.text)).wrap(),
-                );
-            },
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).size(12.5).color(theme.text_muted)).wrap(),
         );
     });
-    ui.add_space(2.0);
+}
+
+fn run_stat(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(10.5)
+                .monospace()
+                .strong()
+                .color(theme.text_muted),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(value)
+                .size(18.0)
+                .monospace()
+                .strong()
+                .color(theme.text),
+        );
+    });
 }
 
 fn wrapped_label(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
@@ -2147,6 +2292,24 @@ fn scope_pill(ui: &mut egui::Ui, theme: &Theme, scope: &str) {
         _ => (theme.warning_soft, theme.warning),
     };
     tinted_pill(ui, theme, scope, fill, color);
+}
+
+fn draw_sparkline(ui: &mut egui::Ui, theme: &Theme, seed: usize, active: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 26.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let color = if active {
+        theme.success
+    } else {
+        mix(theme.text_muted, theme.surface, 0.55)
+    };
+    let mut points = Vec::with_capacity(12);
+    for i in 0..12 {
+        let x = rect.left() + i as f32 * rect.width() / 11.0;
+        let wave = (((i + seed) as f32) * 1.37).sin() * 0.5 + 0.5;
+        let y = rect.bottom() - 6.0 - wave * 12.0;
+        points.push(egui::pos2(x, y));
+    }
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
 }
 
 fn check_dot(ui: &mut egui::Ui, theme: &Theme, selected: bool) {
@@ -2423,7 +2586,7 @@ fn draw_status_pill(
         });
 }
 
-fn draw_pulse_indicator(ui: &mut egui::Ui, theme: &Theme, seconds: f32, running: bool) {
+fn draw_pulse_indicator(ui: &mut egui::Ui, theme: &Theme, running: bool) {
     let size = 44.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2433,47 +2596,46 @@ fn draw_pulse_indicator(ui: &mut egui::Ui, theme: &Theme, seconds: f32, running:
     } else {
         theme.text_muted
     };
-    if running {
-        let pulse = (seconds * 2.0).sin() * 0.5 + 0.5;
-        let radius = 14.0 + pulse * 6.0;
-        painter.circle_filled(
-            center,
-            radius,
-            egui::Color32::from_rgba_unmultiplied(
-                color.r(),
-                color.g(),
-                color.b(),
-                (60.0 + pulse * 60.0) as u8,
-            ),
-        );
-    }
     painter.circle_filled(center, 12.0, color);
+    if running {
+        painter.circle_stroke(center, 17.0, egui::Stroke::new(1.0, color));
+    }
     painter.circle_filled(center, 4.5, egui::Color32::WHITE);
 }
 
-fn draw_combine_diagram(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    seconds: f32,
-    size: egui::Vec2,
-    input_count: usize,
-) {
+fn draw_combine_diagram(ui: &mut egui::Ui, theme: &Theme, size: egui::Vec2, input_count: usize) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
-    painter.rect_filled(rect, 12, theme.surface_alt);
+    painter.rect_filled(rect, 8, theme.bg);
     painter.rect_stroke(
         rect,
-        12,
+        8,
         egui::Stroke::new(1.0, theme.border),
         egui::StrokeKind::Inside,
     );
 
-    let count = input_count.clamp(2, 5);
+    for i in 1..4 {
+        let x = rect.left() + rect.width() * i as f32 / 4.0;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(
+                    theme.border.r(),
+                    theme.border.g(),
+                    theme.border.b(),
+                    70,
+                ),
+            ),
+        );
+    }
+
+    let count = input_count.clamp(2, 8);
     let center_y = rect.center().y;
-    let left_x = rect.left() + 28.0;
+    let left_x = rect.left() + 56.0;
     let merge = egui::pos2(rect.left() + rect.width() * 0.6, center_y);
-    let out = egui::pos2(rect.right() - 28.0, center_y);
+    let out = egui::pos2(rect.right() - 56.0, center_y);
 
     let mut inputs = Vec::with_capacity(count);
     let span = (rect.height() - 60.0).max(40.0);
@@ -2487,22 +2649,16 @@ fn draw_combine_diagram(
         inputs.push(egui::pos2(left_x, y));
     }
 
-    for (index, input) in inputs.iter().enumerate() {
+    for input in &inputs {
         let control = egui::pos2(rect.left() + rect.width() * 0.38, input.y);
         let path = cubic_points(*input, control, merge, 32);
         painter.add(egui::Shape::line(
             path.clone(),
-            egui::Stroke::new(2.0, mix(theme.primary, theme.surface, 0.55)),
+            egui::Stroke::new(1.5, mix(theme.primary, theme.surface, 0.45)),
         ));
-        let progress = ((seconds * 0.5) + index as f32 * 0.18).fract();
-        let dot = sample_polyline(&path, progress);
-        painter.circle_filled(dot, 4.0, theme.primary);
     }
 
-    painter.line_segment([merge, out], egui::Stroke::new(2.6, theme.primary));
-    let output_progress = (seconds * 0.55).fract();
-    let output_dot = egui::pos2(merge.x + (out.x - merge.x) * output_progress, merge.y);
-    painter.circle_filled(output_dot, 4.5, theme.success);
+    painter.line_segment([merge, out], egui::Stroke::new(2.2, theme.success));
 
     for input in &inputs {
         painter.circle_filled(*input, 8.0, theme.surface);
@@ -2514,6 +2670,27 @@ fn draw_combine_diagram(
     painter.circle_filled(out, 10.0, theme.success_soft);
     painter.circle_stroke(out, 10.0, egui::Stroke::new(1.8, theme.success));
     painter.circle_filled(out, 4.0, theme.success);
+    painter.text(
+        egui::pos2(left_x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        format!("SOURCES · {count}"),
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(merge.x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        "MERGE",
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
+    painter.text(
+        egui::pos2(out.x, rect.bottom() - 18.0),
+        egui::Align2::CENTER_CENTER,
+        "EGRESS",
+        egui::FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_muted,
+    );
 }
 
 fn draw_logo_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
@@ -3258,14 +3435,6 @@ fn cubic_points(
             )
         })
         .collect()
-}
-
-fn sample_polyline(points: &[egui::Pos2], t: f32) -> egui::Pos2 {
-    if points.is_empty() {
-        return egui::Pos2::ZERO;
-    }
-    let index = ((points.len() - 1) as f32 * t).round() as usize;
-    points[index.min(points.len() - 1)]
 }
 
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {

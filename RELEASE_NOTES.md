@@ -1,13 +1,13 @@
-# net-combiner v0.1.1
+# net-combiner v0.1.2
 
-This release is a polish update for the first public build.
+This release focuses on the new wizard UI and cleaner VPN startup behavior.
 
 ## Changes
 
-- Windows builds now use the GUI subsystem, so launching the desktop app no longer opens a console window.
-- The Windows executable now embeds the net-combiner icon resource. Installer-created Start Menu and Desktop shortcuts use that icon explicitly.
-- The connection monitor now opens on active connections by default and includes filters for active, recent, and all rows.
-- README files no longer mention earlier implementation references.
+- Reworked the main GUI into a compact step-by-step flow based on the new design reference.
+- Fixed the adapter/settings headers so long labels do not collapse into vertical text.
+- Removed animated page effects from the intro and run views to reduce UI stutter.
+- `tun2proxy-bin.exe` is now spawned without a visible console window on Windows.
 
 ## Packages
 
@@ -19,4 +19,4 @@ This release is a polish update for the first public build.
 
 ## Notes
 
-VPN mode requires administrator or root privileges. On Windows, the installer includes `wintun.dll` and `tun2proxy-bin.exe` beside the application executable. macOS packages are currently unsigned.
+VPN mode still requires administrator or root privileges. On Windows, the installer includes `wintun.dll` and `tun2proxy-bin.exe` beside the application executable. macOS packages are currently unsigned.
