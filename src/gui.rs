@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
@@ -120,6 +120,8 @@ struct NetCombinerApp {
     connection_rx: Option<mpsc::Receiver<proxy::ConnectionEvent>>,
     connection_tx: Option<mpsc::Sender<proxy::ConnectionEvent>>,
     connections: VecDeque<ConnectionRow>,
+    connection_totals: HashMap<String, ConnectionTrafficTotal>,
+    adapter_totals: HashMap<IpAddr, AdapterTrafficTotal>,
     logs: VecDeque<String>,
     log_path: PathBuf,
     log_file: Option<fs::File>,
@@ -200,6 +202,8 @@ impl NetCombinerApp {
             connection_rx: None,
             connection_tx: None,
             connections: VecDeque::new(),
+            connection_totals: HashMap::new(),
+            adapter_totals: HashMap::new(),
             logs: VecDeque::new(),
             log_path,
             log_file,
@@ -377,6 +381,8 @@ impl NetCombinerApp {
         let tx = self.ensure_log_channel();
         let connection_tx = self.ensure_connection_channel();
         self.connections.clear();
+        self.connection_totals.clear();
+        self.adapter_totals.clear();
         match ManagedProxy::start(config, tx, connection_tx) {
             Ok(proxy) => {
                 self.proxy = Some(proxy);
@@ -665,16 +671,27 @@ impl NetCombinerApp {
     fn apply_connection_event(&mut self, event: proxy::ConnectionEvent) {
         match event {
             proxy::ConnectionEvent::Opened(opened) => {
+                self.connection_totals.insert(
+                    opened.id.clone(),
+                    ConnectionTrafficTotal {
+                        egress_ip: opened.egress_ip,
+                        up_bytes: 0,
+                        down_bytes: 0,
+                    },
+                );
                 self.connections.retain(|row| row.id != opened.id);
                 self.connections.push_front(ConnectionRow::from(opened));
             }
             proxy::ConnectionEvent::Updated(updated) => {
+                self.apply_connection_totals(&updated.id, updated.up_bytes, updated.down_bytes);
                 if let Some(row) = self.connections.iter_mut().find(|row| row.id == updated.id) {
                     row.up_bytes = updated.up_bytes;
                     row.down_bytes = updated.down_bytes;
                 }
             }
             proxy::ConnectionEvent::Closed(closed) => {
+                self.apply_connection_totals(&closed.id, closed.up_bytes, closed.down_bytes);
+                self.connection_totals.remove(&closed.id);
                 if let Some(row) = self.connections.iter_mut().find(|row| row.id == closed.id) {
                     row.up_bytes = closed.up_bytes;
                     row.down_bytes = closed.down_bytes;
@@ -684,6 +701,23 @@ impl NetCombinerApp {
             }
         }
         self.prune_connections();
+    }
+
+    fn apply_connection_totals(&mut self, id: &str, up_bytes: u64, down_bytes: u64) {
+        let Some(connection) = self.connection_totals.get_mut(id) else {
+            return;
+        };
+        let delta_up = up_bytes.saturating_sub(connection.up_bytes);
+        let delta_down = down_bytes.saturating_sub(connection.down_bytes);
+        connection.up_bytes = up_bytes;
+        connection.down_bytes = down_bytes;
+        if delta_up == 0 && delta_down == 0 {
+            return;
+        }
+
+        let adapter = self.adapter_totals.entry(connection.egress_ip).or_default();
+        adapter.up_bytes = adapter.up_bytes.saturating_add(delta_up);
+        adapter.down_bytes = adapter.down_bytes.saturating_add(delta_down);
     }
 
     fn prune_connections(&mut self) {
@@ -724,12 +758,10 @@ impl NetCombinerApp {
     }
 
     fn adapter_totals(&self, adapter_ip: IpAddr) -> (u64, u64) {
-        self.connections
-            .iter()
-            .filter(|row| row.egress_ip == adapter_ip)
-            .fold((0_u64, 0_u64), |(up, down), row| {
-                (up + row.up_bytes, down + row.down_bytes)
-            })
+        self.adapter_totals
+            .get(&adapter_ip)
+            .map(|totals| (totals.up_bytes, totals.down_bytes))
+            .unwrap_or((0, 0))
     }
 
     fn handle_tray_event(&mut self, ctx: &egui::Context, event: TrayEvent) {
@@ -918,15 +950,15 @@ impl eframe::App for NetCombinerApp {
             });
 
         egui::TopBottomPanel::bottom("app_footer")
-            .exact_height(94.0)
+            .exact_height(56.0)
             .frame(
                 egui::Frame::new()
                     .fill(theme.bg)
                     .inner_margin(egui::Margin {
                         left: 28,
                         right: 28,
-                        top: 8,
-                        bottom: 8,
+                        top: 6,
+                        bottom: 6,
                     }),
             )
             .show(ctx, |ui| {
@@ -1057,57 +1089,45 @@ impl NetCombinerApp {
 
     fn draw_app_footer(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         divider(ui, theme);
-        ui.add_space(8.0);
-        ui.columns(3, |columns| {
-            columns[0].vertical(|ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("ivLis-Studio")
                         .size(13.0)
                         .strong()
                         .color(theme.text),
                 );
-                ui.add_space(2.0);
+                ui.label(egui::RichText::new("·").size(12.0).color(theme.text_muted));
                 ui.hyperlink_to(
                     egui::RichText::new("github.com/ivLis-Studio/net-combiner")
-                        .size(11.0)
+                        .size(12.0)
                         .color(theme.primary),
                     "https://github.com/ivLis-Studio/net-combiner",
                 );
             });
 
-            columns[1].vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(t.update_title)
-                        .size(12.0)
-                        .strong()
-                        .color(theme.text),
-                );
-                ui.add_space(2.0);
-                wrapped_label(ui, &self.update_status, 11.0, theme.text_muted);
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(10.5)
-                        .monospace()
-                        .color(theme.text_muted),
-                );
-            });
-
-            columns[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let install_enabled =
-                    matches!(self.update_available, Some(true)) && !self.update_busy;
-                let install_label = if matches!(self.update_available, Some(false)) {
-                    t.update_current
-                } else {
-                    t.update_install
-                };
-                if primary_button(ui, theme, install_label, install_enabled).clicked() {
-                    self.start_update_install();
-                }
-                if pill_button(ui, theme, t.update_check, self.update_busy).clicked() {
-                    self.start_update_check();
-                }
-            });
+            if matches!(self.update_available, Some(true)) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(ui, theme, t.update_install, !self.update_busy).clicked() {
+                        self.start_update_install();
+                    }
+                    if pill_button(ui, theme, t.update_check, self.update_busy).clicked() {
+                        self.start_update_check();
+                    }
+                    ui.label(
+                        egui::RichText::new(&self.update_status)
+                            .size(11.5)
+                            .color(theme.text_muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(t.update_title)
+                            .size(12.0)
+                            .strong()
+                            .color(theme.text),
+                    );
+                });
+            }
         });
     }
 }
@@ -1685,7 +1705,9 @@ impl NetCombinerApp {
     fn draw_step_run(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
         section_card(theme).show(ui, |ui| {
             step_header(ui, theme, 5, t.step5_title, t.step5_subtitle);
-            ui.add_space(14.0);
+            ui.add_space(12.0);
+            self.draw_run_adapter_totals(ui, theme, t);
+            ui.add_space(16.0);
 
             let running = self.is_running();
             let mode_label = match self.mode {
@@ -1800,6 +1822,52 @@ impl NetCombinerApp {
                 warning_callout(ui, theme, t.vpn_admin_warning);
             }
         });
+    }
+
+    fn draw_run_adapter_totals(&self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
+        let rows = self
+            .adapters
+            .iter()
+            .filter(|row| row.selected || self.adapter_totals.contains_key(&row.adapter.ip))
+            .collect::<Vec<_>>();
+
+        ui.label(
+            egui::RichText::new(t.adapter_traffic_title)
+                .size(13.0)
+                .strong()
+                .color(theme.text),
+        );
+        ui.add_space(6.0);
+
+        if rows.is_empty() {
+            ui.label(
+                egui::RichText::new(t.adapter_traffic_empty)
+                    .size(11.5)
+                    .color(theme.text_muted),
+            );
+            return;
+        }
+
+        egui::Grid::new("run_adapter_totals_grid")
+            .num_columns(4)
+            .spacing([18.0, 4.0])
+            .striped(false)
+            .show(ui, |ui| {
+                table_header(ui, theme, t.column_adapter);
+                table_header(ui, theme, t.column_egress_ip);
+                table_header(ui, theme, t.column_up);
+                table_header(ui, theme, t.column_down);
+                ui.end_row();
+
+                for row in rows {
+                    let (up, down) = self.adapter_totals(row.adapter.ip);
+                    table_cell(ui, theme, &trim_middle(&row.adapter.name, 28), theme.text);
+                    table_cell(ui, theme, &row.adapter.ip.to_string(), theme.text_muted);
+                    table_cell(ui, theme, &format_bytes(up), theme.text_muted);
+                    table_cell(ui, theme, &format_bytes(down), theme.text_muted);
+                    ui.end_row();
+                }
+            });
     }
 
     fn draw_connections_section(&mut self, ui: &mut egui::Ui, theme: &Theme, t: &Texts<'_>) {
@@ -3238,6 +3306,18 @@ struct AdapterRow {
     weight: u16,
 }
 
+#[derive(Default)]
+struct AdapterTrafficTotal {
+    up_bytes: u64,
+    down_bytes: u64,
+}
+
+struct ConnectionTrafficTotal {
+    egress_ip: IpAddr,
+    up_bytes: u64,
+    down_bytes: u64,
+}
+
 struct ConnectionRow {
     id: String,
     protocol: proxy::ConnectionProtocol,
@@ -3410,6 +3490,8 @@ struct Texts<'a> {
     start_proxy: &'a str,
     start_vpn: &'a str,
     stop: &'a str,
+    adapter_traffic_title: &'a str,
+    adapter_traffic_empty: &'a str,
     vpn_admin_warning: &'a str,
     connections_title: &'a str,
     connections_subtitle: &'a str,
@@ -3540,6 +3622,8 @@ impl<'a> Texts<'a> {
                 start_proxy: "프록시 시작",
                 start_vpn: "VPN 시작",
                 stop: "중지",
+                adapter_traffic_title: "이번 실행 어댑터 사용량",
+                adapter_traffic_empty: "선택된 어댑터의 전송량이 아직 없습니다.",
                 vpn_admin_warning: "VPN 모드는 관리자(또는 root) 권한이 필요합니다. tun2proxy 가 같은 폴더에 있어야 합니다.",
                 connections_title: "연결 상태",
                 connections_subtitle: "어떤 대상 IP가 어떤 어댑터를 통해 나가는지 실시간으로 보여줍니다.",
@@ -3666,6 +3750,8 @@ impl<'a> Texts<'a> {
                 start_proxy: "Start proxy",
                 start_vpn: "Start VPN",
                 stop: "Stop",
+                adapter_traffic_title: "Adapter traffic this run",
+                adapter_traffic_empty: "No selected adapter traffic yet.",
                 vpn_admin_warning: "VPN mode needs administrator/root rights. tun2proxy should be next to the app.",
                 connections_title: "Connection activity",
                 connections_subtitle: "Live view of which target IP leaves through which selected adapter.",
