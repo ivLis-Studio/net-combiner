@@ -1,6 +1,6 @@
 [package]
 name = "net-combiner"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform GUI for combining local network adapters behind a SOCKS proxy and optional local TUN routing."
@@ -18,6 +18,7 @@ eframe = "0.32"
 image = { version = "0.25", default-features = false, features = ["png"] }
 network-interface = "2.0"
 reqwest = { version = "0.13", default-features = false }
+raw-window-handle = "0.6"
 self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "default-tls", "reqwest"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }

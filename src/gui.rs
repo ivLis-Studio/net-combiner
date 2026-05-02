@@ -23,6 +23,7 @@ const MAX_CONNECTION_ROWS: usize = 5_000;
 const PAGE_MAX_WIDTH: f32 = 900.0;
 const WIZARD_STEP_COUNT: usize = 5;
 const ADAPTER_WATCH_INTERVAL: Duration = Duration::from_secs(3);
+const HIDDEN_TRAY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn run_gui() -> Result<()> {
     let icon = load_icon_data();
@@ -175,6 +176,9 @@ impl NetCombinerApp {
             Ok(handle) => (Some(handle), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        if let Some(tray) = &tray {
+            register_main_window_with_tray(tray, cc);
+        }
 
         let mut app = Self {
             adapters: Vec::new(),
@@ -497,8 +501,9 @@ impl NetCombinerApp {
             || self.is_running()
             || self.update_busy
             || !self.update_auto_checked
+            || !self.window_visible
         {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            ctx.request_repaint_after(HIDDEN_TRAY_POLL_INTERVAL);
         }
 
         if self.proxy.as_ref().is_some_and(ManagedProxy::is_finished) {
@@ -835,6 +840,7 @@ impl NetCombinerApp {
             egui::ViewportCommand::Close,
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.request_repaint_after(HIDDEN_TRAY_POLL_INTERVAL);
     }
 
     fn show_main_window(&mut self, ctx: &egui::Context) {
@@ -906,6 +912,10 @@ impl NetCombinerApp {
             return;
         }
         if !matches!(self.update_available, Some(true)) {
+            return;
+        }
+        if self.is_running() {
+            self.update_status = update_install_blocked_status(self.language).to_owned();
             return;
         }
         self.update_busy = true;
@@ -4087,6 +4097,13 @@ fn update_installing_status(language: Language) -> &'static str {
     }
 }
 
+fn update_install_blocked_status(language: Language) -> &'static str {
+    match language {
+        Language::English => "Stop proxy/VPN before installing updates.",
+        Language::Korean => "업데이트를 설치하려면 프록시/VPN을 먼저 중지하세요.",
+    }
+}
+
 fn update_check_status(language: Language, info: &crate::update::UpdateInfo) -> String {
     if info.available {
         match language {
@@ -4126,6 +4143,26 @@ fn update_error_status(language: Language, phase: &str, error: &str) -> String {
 fn connection_monitor_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("net-combiner-connection-monitor")
 }
+
+#[cfg(windows)]
+fn register_main_window_with_tray(tray: &TrayHandle, cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Some(hwnd) = cc
+        .window_handle()
+        .ok()
+        .and_then(|handle| match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    tray.set_main_window(hwnd);
+}
+
+#[cfg(not(windows))]
+fn register_main_window_with_tray(_tray: &TrayHandle, _cc: &eframe::CreationContext<'_>) {}
 
 fn cubic_points(
     start: egui::Pos2,

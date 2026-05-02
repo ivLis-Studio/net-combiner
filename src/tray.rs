@@ -32,14 +32,16 @@ mod platform {
         DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos,
         GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, IDI_APPLICATION, LoadIconW,
         MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
-        SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+        SM_CXSMICON, SM_CYSMICON, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
+        ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUIT,
+        WM_RBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAY: u32 = WM_APP + 31;
     const WM_TRAY_SHUTDOWN: u32 = WM_APP + 32;
     const WM_TRAY_LANGUAGE: u32 = WM_APP + 33;
+    const WM_TRAY_WAKE: u32 = WM_APP + 34;
     const TRAY_UID: u32 = 1;
 
     const ID_SHOW: usize = 1001;
@@ -49,6 +51,7 @@ mod platform {
 
     #[derive(Debug)]
     enum TrayCommand {
+        SetMainWindow(isize),
         SetLanguage(TrayLanguage),
         Shutdown,
     }
@@ -89,6 +92,13 @@ mod platform {
                 let _ = PostMessageW(self.hwnd as HWND, WM_TRAY_LANGUAGE, 0, 0);
             }
         }
+
+        pub fn set_main_window(&self, hwnd: isize) {
+            let _ = self.tx.send(TrayCommand::SetMainWindow(hwnd));
+            unsafe {
+                let _ = PostMessageW(self.hwnd as HWND, WM_TRAY_WAKE, 0, 0);
+            }
+        }
     }
 
     impl Drop for TrayHandle {
@@ -118,6 +128,7 @@ mod platform {
             language,
             event_tx,
             wake,
+            main_hwnd: 0,
             icon: ptr::null_mut(),
             custom_icon: false,
         });
@@ -146,6 +157,9 @@ mod platform {
 
             while let Ok(command) = cmd_rx.try_recv() {
                 match command {
+                    TrayCommand::SetMainWindow(hwnd) => {
+                        runtime.main_hwnd = hwnd;
+                    }
                     TrayCommand::SetLanguage(language) => {
                         runtime.language = language;
                         unsafe {
@@ -168,6 +182,7 @@ mod platform {
         language: TrayLanguage,
         event_tx: mpsc::Sender<TrayEvent>,
         wake: Arc<dyn Fn() + Send + Sync>,
+        main_hwnd: isize,
         icon: HICON,
         custom_icon: bool,
     }
@@ -232,6 +247,7 @@ mod platform {
                 }
                 0
             }
+            WM_TRAY_WAKE => 0,
             WM_TRAY_SHUTDOWN | WM_CLOSE => {
                 DestroyWindow(hwnd);
                 0
@@ -345,13 +361,29 @@ mod platform {
             ID_QUIT => TrayEvent::Quit,
             _ => return,
         };
+        reveal_main_window(runtime.main_hwnd);
         let _ = runtime.event_tx.send(event);
         (runtime.wake)();
     }
 
     fn emit_event(runtime: &TrayRuntime, event: TrayEvent) {
+        if matches!(event, TrayEvent::ShowMain) {
+            reveal_main_window(runtime.main_hwnd);
+        }
         let _ = runtime.event_tx.send(event);
         (runtime.wake)();
+    }
+
+    fn reveal_main_window(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            let hwnd = hwnd as HWND;
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
     }
 
     unsafe fn create_tray_icon() -> Result<HICON> {
@@ -504,6 +536,8 @@ mod platform {
             self.options_item.set_text(labels.options);
             self.quit_item.set_text(labels.quit);
         }
+
+        pub fn set_main_window(&self, _hwnd: isize) {}
     }
 
     pub fn is_supported() -> bool {
@@ -598,6 +632,8 @@ mod platform {
         }
 
         pub fn set_language(&self, _language: TrayLanguage) {}
+
+        pub fn set_main_window(&self, _hwnd: isize) {}
     }
 
     pub fn is_supported() -> bool {

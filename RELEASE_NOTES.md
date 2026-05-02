@@ -1,13 +1,22 @@
-# net-combiner v0.1.9
+# net-combiner v0.1.10
 
-This release refines the run dashboard and footer behavior.
+This release focuses on runtime stability in tray, proxy, VPN, and updater
+flows.
 
 ## Changes
 
-- Added a top-of-run adapter traffic table showing total upload/download per adapter for the current run.
-- Made adapter traffic totals independent of the visible connection list so pruning old rows does not affect the totals.
-- Collapsed the footer brand and GitHub URL onto one line.
-- Hid footer update controls when the running version is already current.
+- Fixed Windows tray actions after the main window is closed to tray. Tray
+  actions now wake and restore the hidden main window before dispatching app
+  commands, so Quit works from the tray-only state.
+- Added bounded outbound TCP connect attempts. A bad or blackholed adapter no
+  longer stalls a new connection until the OS-level TCP timeout.
+- Return a SOCKS5 failure reply when a CONNECT request cannot be routed, instead
+  of closing the client connection abruptly.
+- Cancel UDP response reader tasks when a UDP ASSOCIATE session closes, avoiding
+  leaked sockets and stale connection monitor rows.
+- Block update installation while proxy or VPN mode is running, preventing
+  partial updates when sidecar files are still in use.
+- Added focused unit tests for adapter scheduling and SOCKS UDP packet parsing.
 
 ## Packages
 
@@ -19,4 +28,6 @@ This release refines the run dashboard and footer behavior.
 
 ## Notes
 
-VPN mode still requires administrator or root privileges. On Windows, the installer includes `wintun.dll` and `tun2proxy-bin.exe` beside the application executable. macOS packages are currently unsigned.
+VPN mode still requires administrator or root privileges. On Windows, the
+installer includes `wintun.dll` and `tun2proxy-bin.exe` beside the application
+executable. macOS packages are currently unsigned.

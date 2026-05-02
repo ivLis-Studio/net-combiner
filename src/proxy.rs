@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::adapter::EgressTarget;
 
 const CONNECTION_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOAD_BYTE_UNIT: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +192,18 @@ async fn handle_client(mut inbound: TcpStream, context: ClientContext) -> Result
         SocksCommand::Connect => {
             let target_label = request.target.to_string();
             let (outbound, selected, remote) =
-                connect_via_pool(&request.target, &context.pool).await?;
+                match connect_via_pool(&request.target, &context.pool).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = write_reply(
+                            &mut inbound,
+                            0x04,
+                            zero_socket_addr_for(Some(context.peer)),
+                        )
+                        .await;
+                        return Err(error.context(format!("CONNECT {target_label} failed")));
+                    }
+                };
             let connection_id = context.id.to_string();
             let egress_name = selected.name.clone();
             let egress_ip = selected.ip;
@@ -390,13 +402,21 @@ async fn connect_via_pool(
             continue;
         }
         for selected in selections {
-            match connect_bound(selected.ip, remote).await {
-                Ok(stream) => return Ok((stream, selected, remote)),
-                Err(error) => {
+            match tokio::time::timeout(CONNECT_TIMEOUT, connect_bound(selected.ip, remote)).await {
+                Ok(Ok(stream)) => return Ok((stream, selected, remote)),
+                Ok(Err(error)) => {
                     last_error = Some(anyhow!(
                         "failed to connect {remote} via {} ({}): {error}",
                         selected.name,
                         selected.ip
+                    ));
+                }
+                Err(_) => {
+                    last_error = Some(anyhow!(
+                        "timed out connecting {remote} via {} ({}) after {} ms",
+                        selected.name,
+                        selected.ip,
+                        CONNECT_TIMEOUT.as_millis()
                     ));
                 }
             }
@@ -623,6 +643,7 @@ struct UdpResponseReaderContext {
     pool: Arc<WeightedPool>,
     monitor: Option<mpsc::Sender<ConnectionEvent>>,
     log: mpsc::Sender<String>,
+    cancel: CancellationToken,
 }
 
 async fn run_udp_association(mut control: TcpStream, context: UdpAssociationContext) -> Result<()> {
@@ -646,6 +667,7 @@ async fn run_udp_association(mut control: TcpStream, context: UdpAssociationCont
 
     let client_addr = Arc::new(Mutex::new(None::<SocketAddr>));
     let mappings = Arc::new(AsyncMutex::new(HashMap::<SocketAddr, Arc<UdpFlow>>::new()));
+    let association_cancel = cancel.child_token();
     let relay_task = tokio::spawn(run_udp_relay(UdpRelayContext {
         id,
         relay: relay.clone(),
@@ -654,12 +676,12 @@ async fn run_udp_association(mut control: TcpStream, context: UdpAssociationCont
         pool: pool.clone(),
         log: log.clone(),
         monitor: monitor.clone(),
-        cancel: cancel.clone(),
+        cancel: association_cancel.clone(),
     }));
 
     let mut scratch = [0_u8; 1];
     tokio::select! {
-        _ = cancel.cancelled() => {}
+        _ = association_cancel.cancelled() => {}
         result = control.read(&mut scratch) => {
             match result {
                 Ok(_) => {}
@@ -668,7 +690,9 @@ async fn run_udp_association(mut control: TcpStream, context: UdpAssociationCont
         }
     }
 
+    association_cancel.cancel();
     relay_task.abort();
+    let _ = relay_task.await;
     let remotes = {
         let guard = mappings.lock().await;
         guard
@@ -791,6 +815,7 @@ async fn run_udp_relay(context: UdpRelayContext) -> Result<()> {
                             pool: pool.clone(),
                             monitor: monitor.clone(),
                             log: log.clone(),
+                            cancel: cancel.clone(),
                         });
                         guard.insert(remote, flow.clone());
                         flow
@@ -840,17 +865,23 @@ fn spawn_udp_response_reader(context: UdpResponseReaderContext) {
             pool,
             monitor,
             log,
+            cancel,
         } = context;
         let mut buffer = vec![0_u8; 65_535];
         loop {
-            let length = match flow.socket.recv(&mut buffer).await {
-                Ok(length) => length,
-                Err(error) => {
-                    log_line(
-                        &log,
-                        format!("#{id} UDP receive from {remote} failed: {error}"),
-                    );
-                    return;
+            let length = tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = flow.socket.recv(&mut buffer) => {
+                    match result {
+                        Ok(length) => length,
+                        Err(error) => {
+                            log_line(
+                                &log,
+                                format!("#{id} UDP receive from {remote} failed: {error}"),
+                            );
+                            return;
+                        }
+                    }
                 }
             };
 
@@ -1303,4 +1334,70 @@ fn emit_connection(monitor: &Option<mpsc::Sender<ConnectionEvent>>, event: Conne
 
 fn log_line(log: &mpsc::Sender<String>, message: impl Into<String>) {
     let _ = log.send(message.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(name: &str, last_octet: u8) -> EgressTarget {
+        EgressTarget {
+            name: name.to_owned(),
+            ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, last_octet)),
+            weight: 1,
+        }
+    }
+
+    #[test]
+    fn per_connection_prefers_idle_adapter() {
+        let first = target("first", 10);
+        let second = target("second", 11);
+        let mut state = WeightedState::new(vec![first.clone(), second.clone()]);
+
+        let remote_a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let selected = state.ordered_for(remote_a, EgressStrategy::PerConnection)[0].ip;
+        state.record_open(remote_a, selected, EgressStrategy::PerConnection);
+
+        let remote_b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+        let next = state.ordered_for(remote_b, EgressStrategy::PerConnection)[0].ip;
+
+        assert_eq!(next, second.ip);
+    }
+
+    #[test]
+    fn per_destination_stays_sticky_until_last_flow_closes() {
+        let first = target("first", 10);
+        let second = target("second", 11);
+        let mut state = WeightedState::new(vec![first.clone(), second]);
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+
+        let selected = state.ordered_for(remote, EgressStrategy::PerDestination)[0].ip;
+        state.record_open(remote, selected, EgressStrategy::PerDestination);
+        state.record_open(remote, selected, EgressStrategy::PerDestination);
+
+        let sticky = state.ordered_for(remote, EgressStrategy::PerDestination)[0].ip;
+        assert_eq!(sticky, selected);
+
+        state.record_close(remote, selected, 0, EgressStrategy::PerDestination);
+        assert!(state.destination_map.contains_key(&remote));
+
+        state.record_close(remote, selected, 0, EgressStrategy::PerDestination);
+        assert!(!state.destination_map.contains_key(&remote));
+    }
+
+    #[test]
+    fn parses_udp_domain_packet() {
+        let mut packet = vec![0, 0, 0, 0x03, 11];
+        packet.extend_from_slice(b"example.com");
+        packet.extend_from_slice(&443_u16.to_be_bytes());
+        packet.extend_from_slice(b"payload");
+
+        let parsed = parse_udp_packet(&packet).expect("valid UDP packet");
+
+        assert_eq!(
+            parsed.target,
+            SocksTarget::Domain("example.com".to_owned(), 443)
+        );
+        assert_eq!(parsed.payload, b"payload");
+    }
 }
